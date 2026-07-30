@@ -68,7 +68,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 12. Start north poll loop — fetches tasks from Forgejo
+	// 11a. Register and declare with Forgejo before polling
+	logger.Info("registering runner with Forgejo")
+	if err := northClient.Register(ctx); err != nil {
+		logger.Error("runner registration failed", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("declaring runner labels and version")
+	if err := northClient.Declare(ctx); err != nil {
+		logger.Error("runner declaration failed", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("runner registered successfully")
+	healthChecker.SetReady(true)
+
 	taskCh := make(chan *store.TaskCtx, cfg.MaxParallelTasks)
 	go northClient.PollLoop(ctx, taskCh)
 
