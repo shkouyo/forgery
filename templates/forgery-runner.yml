@@ -30,21 +30,29 @@ jobs:
             -o /usr/local/bin/forgejo-runner
           chmod +x /usr/local/bin/forgejo-runner
 
-      - name: Generate runner config
-        run: |
-          mkdir -p /tmp/forgejo-runner
-          cat > /tmp/forgejo-runner/config.yml <<EOF
-          runner:
-            labels:
-          ${{ inputs.labels }}
-          EOF
-
       - name: Run forgejo-runner one-job
         run: |
+          mkdir -p /tmp/forgejo-runner
+
+          # Write registration token to a file (required by --token-url)
+          printf '%s' "${{ inputs.reg_token }}" > /tmp/forgejo-runner/token
+
+          # Generate a random runner UUID
+          RUNNER_UUID="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || printf '%08x-%04x-%04x-%04x-%012x' $RANDOM $RANDOM $RANDOM $RANDOM $RANDOM)"
+
+          # Split comma-separated labels into individual --label flags
+          labels="${{ inputs.labels }}"
+          label_args=()
+          IFS=',' read -ra label_array <<< "$labels"
+          for lbl in "${label_array[@]}"; do
+            lbl="${lbl#"${lbl%%[![:space:]]*}"}"
+            lbl="${lbl%"${lbl##*[![:space:]]}"}"
+            [ -n "$lbl" ] && label_args+=(--label "$lbl")
+          done
+
           forgejo-runner one-job \
-            --config /tmp/forgejo-runner/config.yml \
-            register \
-              --name "forgery-worker-${{ inputs.task_id }}" \
-              --token "${{ inputs.reg_token }}" \
-              --instance "${{ inputs.proxy_url }}" \
-              --ephemeral
+            --url "${{ inputs.proxy_url }}" \
+            --uuid "${RUNNER_UUID}" \
+            --token-url "file:///tmp/forgejo-runner/token" \
+            "${label_args[@]}" \
+            --wait
