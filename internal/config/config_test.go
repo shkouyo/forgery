@@ -38,7 +38,6 @@ func TestLoadAllEnvVars(t *testing.T) {
 	t.Setenv("PING_KEEPALIVE", "false")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("LOG_FORMAT", "text")
-	t.Setenv("METRICS_ADDR", ":9091")
 	t.Setenv("HEALTH_ADDR", ":8080")
 	t.Setenv("TLS_INSECURE_SKIP_VERIFY", "true")
 
@@ -122,9 +121,6 @@ func TestLoadAllEnvVars(t *testing.T) {
 	if cfg.LogFormat != "text" {
 		t.Errorf("LogFormat = %q", cfg.LogFormat)
 	}
-	if cfg.MetricsAddr != ":9091" {
-		t.Errorf("MetricsAddr = %q", cfg.MetricsAddr)
-	}
 	if cfg.HealthAddr != ":8080" {
 		t.Errorf("HealthAddr = %q", cfg.HealthAddr)
 	}
@@ -192,9 +188,6 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.LogFormat != "json" {
 		t.Errorf("LogFormat = %q, want %q", cfg.LogFormat, "json")
-	}
-	if cfg.MetricsAddr != ":9090" {
-		t.Errorf("MetricsAddr = %q, want %q", cfg.MetricsAddr, ":9090")
 	}
 	if cfg.HealthAddr != "" {
 		t.Errorf("HealthAddr = %q, want %q", cfg.HealthAddr, "")
@@ -711,7 +704,6 @@ func TestAllFieldsPopulatedRoundTrip(t *testing.T) {
 	t.Setenv("PING_KEEPALIVE", "false")
 	t.Setenv("LOG_LEVEL", "error")
 	t.Setenv("LOG_FORMAT", "text")
-	t.Setenv("METRICS_ADDR", ":2112")
 	t.Setenv("HEALTH_ADDR", ":8086")
 	t.Setenv("TLS_INSECURE_SKIP_VERIFY", "true")
 
@@ -740,7 +732,6 @@ func TestAllFieldsPopulatedRoundTrip(t *testing.T) {
 		{"PingKeepalive", cfg.PingKeepalive, false},
 		{"LogLevel", cfg.LogLevel, "error"},
 		{"LogFormat", cfg.LogFormat, "text"},
-		{"MetricsAddr", cfg.MetricsAddr, ":2112"},
 		{"HealthAddr", cfg.HealthAddr, ":8086"},
 		{"TLSInsecureSkipVerify", cfg.TLSInsecureSkipVerify, true},
 	}

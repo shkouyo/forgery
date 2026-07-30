@@ -51,7 +51,6 @@ type Config struct {
 	// ── Observability ──
 	LogLevel    string // LOG_LEVEL (default: "info")
 	LogFormat   string // LOG_FORMAT (default: "json")
-	MetricsAddr string // METRICS_ADDR (default: ":9090")
 	HealthAddr  string // HEALTH_ADDR (default: "")
 
 	// ── TLS ──
@@ -97,7 +96,6 @@ func Load() (*Config, error) {
 
 	cfg.LogLevel = os.Getenv("LOG_LEVEL")
 	cfg.LogFormat = os.Getenv("LOG_FORMAT")
-	cfg.MetricsAddr = os.Getenv("METRICS_ADDR")
 	cfg.HealthAddr = os.Getenv("HEALTH_ADDR")
 
 	cfg.TLSInsecureSkipVerify = parseBool(os.Getenv("TLS_INSECURE_SKIP_VERIFY"))
@@ -229,9 +227,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.LogFormat == "" {
 		cfg.LogFormat = "json"
-	}
-	if cfg.MetricsAddr == "" {
-		cfg.MetricsAddr = ":9090"
 	}
 	// HealthAddr default is already "" (zero value).
 	// TLSInsecureSkipVerify default is already false (zero value).
