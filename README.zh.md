@@ -4,11 +4,11 @@
 
 **Forgery** 是一个 Go 守护进程, 充当 Forgejo 与 GitHub Actions 之间的双向代理. 它像普通 runner 一样向 Forgejo 注册, 但不在本地执行作业, 而是将任务委托给在 GitHub Actions workflow 中运行的 `forgejo-runner` 实例.
 
-## Overview
+## 概述
 
 **Forgery** 连接到你的 Forgejo 实例作为 Actions runner, 通过标准 gRPC 协议轮询任务. 当任务到达时, **Forgery** 在 GitHub Actions 上触发一个 `workflow_dispatch` 事件. 该 workflow 以临时 `one-job` 模式启动官方 `forgejo-runner` 二进制文件, 连接回 **Forgery** 的南向 gRPC 端点, 通过 **Forgery** 从 Forgejo 获取实际任务, 在容器中执行, 并将日志和结果通过 **Forgery** 流式传回 Forgejo.
 
-## Quick Start
+## 快速开始
 
 **1. 克隆并构建**
 
@@ -55,7 +55,7 @@ GITHUB_WORKFLOW_ID=forgery-runner.yml
 
 **Forgery** 默认在 `:8443` 上监听纯 HTTP. 生产环境前应放置一个 TLS 终止反向代理 (Caddy, nginx).
 
-## Configuration
+## 配置
 
 **Forgery** 完全通过环境变量配置, 可选 `.env` 文件作为后备. 加载顺序为:
 
@@ -115,7 +115,7 @@ DEFAULT_CONTAINER_IMAGE=docker://ghcr.io/catthehacker/ubuntu:act-latest
 
 相同的标签字符串同时用于北向注册 (让 Forgejo 知道路由哪些任务到 Forgery) 和内部 runner 配置 (让 GA workflow 知道使用哪个容器).
 
-## How It Works
+## 工作原理
 
 1. **Forgejo 分发作业** -- 已注册为 runner 的 Forgery 通过 `FetchTask` 接收作业.
 2. **Forgery 触发 GitHub Actions Workflow** -- 调用 `workflow_dispatch` API, 传递任务元数据 (代理 URL, 一次性注册令牌, 标签, 容器镜像).
@@ -123,7 +123,7 @@ DEFAULT_CONTAINER_IMAGE=docker://ghcr.io/catthehacker/ubuntu:act-latest
 4. **Forgery 将任务交给内部 runner** -- runner 获取任务, 在容器内执行, 并报告结果.
 5. **日志和任务状态回流** -- `UpdateTask` 和 `UpdateLog` RPC 通过 Forgery 透明中继回 Forgejo.
 
-## Build & Test
+## 构建与测试
 
 ### 前置要求
 
@@ -170,7 +170,7 @@ forgery/
 
 模块路径: `git.0x0f.dev/forgery`.
 
-## Security
+## 安全
 
 ### 北向
 
@@ -191,13 +191,13 @@ TLS 在反向代理 (Caddy 或 nginx) 处终止. 代理负责证书管理 (例�
 
 来自 Forgejo 仓库密钥的传入任务**仅在内存中**保存, 并通过 TLS 连接转发. 绝不会写入磁盘或记录到日志中.
 
-### GitHub PAT
+### GitHub 个人访问令牌
 
 - `GITHUB_TOKEN` 应为**细粒度个人访问令牌**, 限定到单个仓库.
 - 最低所需权限: `contents: read` 和 `actions: write`.
 - Actions workflow 中的内置 `GITHUB_TOKEN` 由 runner workflow 自身使用, 无需额外配置.
 
-## License
+## 许可证
 
 Copyright (C) 2026 ShinKouyo <i@0x0f.dev>
 
