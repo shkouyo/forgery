@@ -199,7 +199,7 @@ TLS 在反向代理 (Caddy 或 nginx) 处终止. 代理负责证书管理 (例�
 
 ## 许可证
 
-Copyright (C) 2026 ShinKouyo <i@0x0f.dev>
+Copyright (C) 2026 ShinKouyo &lt;i@0x0f.dev&gt;
 
 本程序为自由软件, 在 Free Software Foundation 发布的 GNU General Public License
 的约束下, 你可以对其进行再发布及修改. 协议版本为第三版或 (按你的选择) 任何更新

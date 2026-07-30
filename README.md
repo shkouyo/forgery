@@ -199,7 +199,7 @@ Forgejo repository secrets from incoming tasks are held **only in memory** and f
 
 ## License
 
-Copyright (C) 2026 ShinKouyo <i@0x0f.dev>
+Copyright (C) 2026 ShinKouyo &lt;i@0x0f.dev&gt;
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
