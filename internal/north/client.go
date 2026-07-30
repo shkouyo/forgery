@@ -23,18 +23,21 @@ import (
 // It registers as an Actions runner, polls for tasks, and forwards
 // status/log updates from the internal runner back to Forgejo.
 type Client struct {
-	client runnerv1connect.RunnerServiceClient
-	cfg    *config.Config
-	store  store.TaskStore
-	sem    chan struct{} // backpressure semaphore
-	log    *slog.Logger
+	client     runnerv1connect.RunnerServiceClient
+	runnerUUID string // set from Register response, sent as x-runner-uuid header
+	cfg        *config.Config
+	store      store.TaskStore
+	sem        chan struct{} // backpressure semaphore
+	log        *slog.Logger
 }
 
 // New creates a new northbound Client.
 //
 // It constructs a net/http.Client with HTTP/2 support (required for gRPC)
 // and wraps it with the Connect-generated RunnerServiceClient configured
-// to speak gRPC protocol. The base URL has /api/actions appended because
+// to speak gRPC protocol. An auth interceptor is installed that injects
+// x-runner-token, x-runner-version, and x-runner-uuid (once registered)
+// into every outgoing request. The base URL has /api/actions appended because
 // Forgejo mounts the runner service at that path prefix.
 // maxParallel controls the backpressure semaphore capacity.
 func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logger) *Client {
@@ -53,21 +56,45 @@ func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logge
 
 	httpClient := &http.Client{Transport: baseTransport}
 
+	c := &Client{
+		cfg:   cfg,
+		store: s,
+		sem:   make(chan struct{}, maxParallel),
+		log:   log,
+	}
+
+	// Auth interceptor injects runner token and version into every request.
+	// Once Register completes, the runner UUID (from the response) is also
+	// included. The closure captures c so it always reads the latest UUID.
+	authInterceptor := connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
+		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			req.Header().Set("x-runner-token", cfg.ForgejoRunnerToken)
+			req.Header().Set("x-runner-version", "1.0.0")
+			if c.runnerUUID != "" {
+				req.Header().Set("x-runner-uuid", c.runnerUUID)
+			}
+			return next(ctx, req)
+		})
+	})
+
 	// Forgejo mounts the runner gRPC service at /api/actions/.
 	runnerURL := cfg.ForgejoURL + "/api/actions"
+	c.client = runnerv1connect.NewRunnerServiceClient(
+		httpClient,
+		runnerURL,
+		connect.WithGRPC(),
+		connect.WithInterceptors(authInterceptor),
+	)
 
-	return &Client{
-		client: runnerv1connect.NewRunnerServiceClient(httpClient, runnerURL, connect.WithGRPC()),
-		cfg:    cfg,
-		store:  s,
-		sem:    make(chan struct{}, maxParallel),
-		log:    log,
-	}
+	return c
 }
 
 // Register calls the Forgejo Register RPC with the configured runner
 // token, name, labels, and version. It must be called once at startup
 // before Declare or FetchTask.
+//
+// On success the runner UUID from the response is saved and will be
+// included as the x-runner-uuid header in all subsequent requests.
 func (c *Client) Register(ctx context.Context) error {
 	req := connect.NewRequest(&v1.RegisterRequest{
 		Token:   c.cfg.ForgejoRunnerToken,
@@ -75,8 +102,15 @@ func (c *Client) Register(ctx context.Context) error {
 		Labels:  c.cfg.ForgejoRunnerLabels,
 		Version: "1.0.0",
 	})
-	_, err := c.client.Register(ctx, req)
-	return err
+	resp, err := c.client.Register(ctx, req)
+	if err != nil {
+		return err
+	}
+	// Save runner UUID for subsequent request headers.
+	if runner := resp.Msg.GetRunner(); runner != nil {
+		c.runnerUUID = runner.GetUuid()
+	}
+	return nil
 }
 
 // Declare announces the runner's labels and version to Forgejo.

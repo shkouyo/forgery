@@ -7,7 +7,6 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
 	"git.0x0f.dev/forgery/internal/config"
 	"git.0x0f.dev/forgery/internal/dispatch"
 	"git.0x0f.dev/forgery/internal/north"
@@ -81,7 +80,6 @@ func main() {
 	}
 	logger.Info("runner registered successfully")
 	healthChecker.SetReady(true)
-
 	taskCh := make(chan *store.TaskCtx, cfg.MaxParallelTasks)
 	go northClient.PollLoop(ctx, taskCh)
 
