@@ -252,18 +252,17 @@ DEFAULT_CONTAINER_IMAGE=docker://ghcr.io/catthehacker/ubuntu:act-latest
 cp templates/forgery-runner.yml path/to/your-repo/.github/workflows/
 ```
 
-### 2. 设置 Runner 版本
+### 2. Runner 版本
 
 Workflow 使用 `$FORGEJO_RUNNER_VERSION` 确定要下载哪个 `forgejo-runner` 二进制文件。
-将其设置为仓库中的 **GitHub Actions 变量**（Settings → Secrets and variables →
-Actions → Variables）：
+默认情况下会自动从 Forgejo API 获取最新版本。如需固定特定版本，请将其设置为仓库中的
+**GitHub Actions 变量**（Settings → Secrets and variables → Actions → Variables）：
 
 | 变量 | 值 |
 |----------|-------|
-| `FORGEJO_RUNNER_VERSION` | `v12.8.0`（未设置时的默认值） |
+| `FORGEJO_RUNNER_VERSION` | `v12.13.2`（示例；未设置时默认自动获取最新版） |
 
 请与你的 Forgejo 实例期望的 Forgejo runner 版本保持同步。
-
 ### 3. 内置 `GITHUB_TOKEN`
 
 Workflow 内部使用的 `GITHUB_TOKEN` 是 GitHub Actions 提供的标准

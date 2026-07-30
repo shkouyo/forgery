@@ -281,20 +281,20 @@ repository specified by `GITHUB_REPO`:
 cp templates/forgery-runner.yml path/to/your-repo/.github/workflows/
 ```
 
-### 2. Set the Runner Version
+### 2. Runner Version
 
 The workflow uses `$FORGEJO_RUNNER_VERSION` to determine which
-`forgejo-runner` binary to download. Set this as a **GitHub Actions
-variable** in your repository (Settings → Secrets and variables →
-Actions → Variables):
+`forgejo-runner` binary to download. By default, it automatically fetches
+the latest version from the Forgejo API. To pin a specific version, set
+this as a **GitHub Actions variable** in your repository (Settings →
+Secrets and variables → Actions → Variables):
 
 | Variable | Value |
 |----------|-------|
-| `FORGEJO_RUNNER_VERSION` | `v12.8.0` (default if not set) |
+| `FORGEJO_RUNNER_VERSION` | `v12.13.2` (example; defaults to latest if not set) |
 
 Keep this in sync with the Forgejo runner version your Forgejo instance
 expects.
-
 ### 3. Built-in `GITHUB_TOKEN`
 
 The `GITHUB_TOKEN` used inside the workflow is the standard

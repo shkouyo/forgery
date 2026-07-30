@@ -25,10 +25,8 @@ jobs:
     steps:
       - name: Download forgejo-runner
         run: |
-          # 下载指定版本的 forgejo-runner 二进制
-          # 版本通过环境变量 FORGEJO_RUNNER_VERSION 控制（Actions vars/secrets）
-          RUNNER_VERSION="${FORGEJO_RUNNER_VERSION:-v12.8.0}"
-          curl -sSL "https://code.forgejo.org/forgejo/runner/releases/download/${RUNNER_VERSION}/forgejo-runner-${RUNNER_VERSION}-linux-amd64" \
+          RUNNER_VERSION="${FORGEJO_RUNNER_VERSION:-$(curl -sSL https://code.forgejo.org/api/v1/repos/forgejo/runner/releases/latest | grep -o '"tag_name":"[^"]*"' | cut -d'"' -f4)}"
+          curl -sSL "https://code.forgejo.org/forgejo/runner/releases/download/${RUNNER_VERSION}/forgejo-runner-${RUNNER_VERSION#v}-linux-amd64" \
             -o /usr/local/bin/forgejo-runner
           chmod +x /usr/local/bin/forgejo-runner
 
