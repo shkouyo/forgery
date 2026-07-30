@@ -1,0 +1,9 @@
+/forgery
+*.out
+*.test
+/vendor/
+.env
+.env.local
+.env.*.local
+*.log
+/tmp/
