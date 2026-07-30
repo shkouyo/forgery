@@ -207,4 +207,5 @@ Copyright (C) 2026 ShinKouyo &lt;i@0x0f.dev&gt;
 
 本程序分发时希望它有用, 但**不提供任何担保**; 甚至不提供适销性或特定用途适用性
 的默示担保. 详情参见 GNU General Public License.
+
 完整许可证文本见 [COPYING](COPYING).
