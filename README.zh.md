@@ -6,7 +6,7 @@
 
 ## 概述
 
-**Forgery** 连接到你的 Forgejo 实例作为 Actions runner, 通过标准 gRPC 协议轮询任务. 当任务到达时, **Forgery** 在 GitHub Actions 上触发一个 `workflow_dispatch` 事件. 该 workflow 以临时 `one-job` 模式启动官方 `forgejo-runner` 二进制文件, 连接回 **Forgery** 的南向 gRPC 端点, 通过 **Forgery** 从 Forgejo 获取实际任务, 在容器中执行, 并将日志和结果通过 **Forgery** 流式传回 Forgejo.
+Forgery 连接到你的 Forgejo 实例作为 Actions runner, 通过标准 gRPC 协议轮询任务. 当任务到达时, Forgery 在 GitHub Actions 上触发一个 `workflow_dispatch` 事件. 该 workflow 以临时 `one-job` 模式启动官方 `forgejo-runner` 二进制文件, 连接回 Forgery 的南向 gRPC 端点, 通过 Forgery 从 Forgejo 获取实际任务, 在容器中执行, 并将日志和结果通过 Forgery 流式传回 Forgejo.
 
 ## 快速开始
 
@@ -53,11 +53,11 @@ GITHUB_WORKFLOW_ID=forgery-runner.yml
 
 **5. 配置反向代理**
 
-**Forgery** 默认在 `:8443` 上监听纯 HTTP. 生产环境前应放置一个 TLS 终止反向代理 (Caddy, nginx).
+Forgery 默认在 `:8443` 上监听纯 HTTP. 生产环境前应放置一个 TLS 终止反向代理 (Caddy, nginx).
 
 ## 配置
 
-**Forgery** 完全通过环境变量配置, 可选 `.env` 文件作为后备. 加载顺序为:
+Forgery 完全通过环境变量配置, 可选 `.env` 文件作为后备. 加载顺序为:
 
 1. `.env` 文件 (不存在则静默跳过)
 2. OS 环境变量 (覆盖 `.env`)
@@ -174,7 +174,7 @@ forgery/
 
 ### 北向
 
-**Forgery** 通过 HTTPS 连接 Forgejo. 确保 `FORGEJO_URL` 使用 `https://`. 使用自签名证书进行开发时, 设置 `TLS_INSECURE_SKIP_VERIFY=true`.
+Forgery 通过 HTTPS 连接 Forgejo. 确保 `FORGEJO_URL` 使用 `https://`. 使用自签名证书进行开发时, 设置 `TLS_INSECURE_SKIP_VERIFY=true`.
 
 ### 南向
 
