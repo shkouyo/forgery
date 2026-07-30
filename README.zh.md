@@ -2,7 +2,7 @@
 
 # Forgery
 
-**Forgery** is a Go daemon that acts as a bidirectional proxy between Forgejo and GitHub Actions. It registers with Forgejo as a normal runner, but instead of executing jobs locally, it delegates them to a `forgejo-runner` instance running inside a GitHub Actions workflow.
+**Forgery** 是一个 Go 守护进程, 充当 Forgejo 与 GitHub Actions 之间的双向代理. 它像普通 runner 一样向 Forgejo 注册, 但不在本地执行作业, 而是将任务委托给在 GitHub Actions workflow 中运行的 `forgejo-runner` 实例.
 
 ## Overview
 
@@ -10,7 +10,7 @@
 
 ## Quick Start
 
-**1. Clone and build**
+**1. 克隆并构建**
 
 ```sh
 git clone https://git.0x0f.dev/forgery
@@ -20,7 +20,7 @@ go build ./cmd/forgery
 
 前置要求: Go 1.25.0.
 
-**2. Copy the workflow template**
+**2. 复制 Workflow 模板**
 
 将 `templates/forgery-runner.yml` 复制到 `GITHUB_REPO` 指定仓库的 `.github/workflows/` 目录:
 
@@ -28,7 +28,7 @@ go build ./cmd/forgery
 cp templates/forgery-runner.yml /path/to/your/repo/.github/workflows/
 ```
 
-**3. Set environment variables**
+**3. 设置环境变量**
 
 创建 `.env` 文件或导出以下环境变量:
 
@@ -45,13 +45,13 @@ GITHUB_REPO=your-org/your-repo
 GITHUB_WORKFLOW_ID=forgery-runner.yml
 ```
 
-**4. Run Forgery**
+**4. 运行 Forgery**
 
 ```sh
 ./forgery
 ```
 
-**5. Configure a reverse proxy**
+**5. 配置反向代理**
 
 **Forgery** 默认在 `:8443` 上监听纯 HTTP. 生产环境前应放置一个 TLS 终止反向代理 (Caddy, nginx).
 
@@ -64,14 +64,14 @@ GITHUB_WORKFLOW_ID=forgery-runner.yml
 3. 未设置字段的默认值
 4. 必填字段的验证
 
-### Environment Variable Reference
+### 环境变量参考
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `FORGEJO_URL` | Yes | -- | Forgejo 实例基础 URL (例如 `https://forgejo.example.com`) |
 | `FORGEJO_RUNNER_TOKEN` | Yes | -- | Forgejo runner 注册令牌 |
 | `FORGEJO_RUNNER_NAME` | Yes | -- | 在 Forgejo runner 列表中显示的显示名称 |
-| `FORGEJO_RUNNER_LABELS` | Yes | -- | 逗号分隔的标签及可选容器镜像映射 (见 [Labels](#labels)) |
+| `FORGEJO_RUNNER_LABELS` | Yes | -- | 逗号分隔的标签及可选容器镜像映射 (见 [标签](#标签-labels)) |
 | `GITHUB_TOKEN` | Yes | -- | 具有 `workflow` 权限的 GitHub 个人访问令牌 (建议使用细粒度仓库作用域令牌) |
 | `GITHUB_REPO` | Yes | -- | 存放 workflow 的仓库, 格式为 `owner/repo` |
 | `GITHUB_WORKFLOW_ID` | Yes | -- | Workflow 文件名 (例如 `forgery-runner.yml`) 或 workflow ID |
@@ -91,7 +91,7 @@ GITHUB_WORKFLOW_ID=forgery-runner.yml
 | `HEALTH_ADDR` | No | -- | 健康检查端点监听地址 (设置后暴露 `/healthz` 和 `/readyz`) |
 | `TLS_INSECURE_SKIP_VERIFY` | No | `false` | 跳过北向连接 TLS 证书验证 (仅开发环境) |
 
-### Labels
+### 标签 (Labels)
 
 `FORGEJO_RUNNER_LABELS` 使用以下格式将 Forgejo `runs-on` 标签映射到容器镜像:
 
@@ -117,27 +117,27 @@ DEFAULT_CONTAINER_IMAGE=docker://ghcr.io/catthehacker/ubuntu:act-latest
 
 ## How It Works
 
-1. **Forgejo dispatches a job** -- 已注册为 runner 的 Forgery 通过 `FetchTask` 接收作业.
-2. **Forgery triggers a GitHub Actions workflow** -- 调用 `workflow_dispatch` API, 传递任务元数据 (代理 URL, 一次性注册令牌, 标签, 容器镜像).
-3. **The GA workflow starts a real `forgejo-runner`** -- 下载官方 runner 二进制文件, 以 `one-job` 临时模式启动, 连接回 Forgery 的 gRPC 端点.
-4. **Forgery hands the Forgejo task to the internal runner** -- runner 获取任务, 在容器内执行, 并报告结果.
-5. **Logs and task status flow back** -- `UpdateTask` 和 `UpdateLog` RPC 通过 Forgery 透明中继回 Forgejo.
+1. **Forgejo 分发作业** -- 已注册为 runner 的 Forgery 通过 `FetchTask` 接收作业.
+2. **Forgery 触发 GitHub Actions Workflow** -- 调用 `workflow_dispatch` API, 传递任务元数据 (代理 URL, 一次性注册令牌, 标签, 容器镜像).
+3. **GA Workflow 启动 forgejo-runner** -- 下载官方 runner 二进制文件, 以 `one-job` 临时模式启动, 连接回 Forgery 的 gRPC 端点.
+4. **Forgery 将任务交给内部 runner** -- runner 获取任务, 在容器内执行, 并报告结果.
+5. **日志和任务状态回流** -- `UpdateTask` 和 `UpdateLog` RPC 通过 Forgery 透明中继回 Forgejo.
 
 ## Build & Test
 
-### Prerequisites
+### 前置要求
 
 - Go 1.25.0
 - 访问已启用 Actions 的 Forgejo 实例
 - 一个用于 runner workflow 的 GitHub 仓库
 
-### Build
+### 构建
 
 ```sh
 go build ./cmd/forgery
 ```
 
-### Test
+### 测试
 
 ```sh
 go test ./... -race
@@ -145,7 +145,7 @@ go test ./... -race
 
 所有测试按惯例使用 `-race` 标志运行. `store` 和 `session` 包包含并发访问测试.
 
-### Project Structure
+### 项目结构
 
 ```
 forgery/
@@ -172,22 +172,22 @@ forgery/
 
 ## Security
 
-### Northbound (Forgery -> Forgejo)
+### 北向 (Forgery -> Forgejo)
 
 **Forgery** 通过 HTTPS 连接 Forgejo. 确保 `FORGEJO_URL` 使用 `https://`. 使用自签名证书进行开发时, 设置 `TLS_INSECURE_SKIP_VERIFY=true`.
 
-### Southbound (internal runner -> Forgery)
+### 南向 (internal runner -> Forgery)
 
 TLS 在反向代理 (Caddy 或 nginx) 处终止. 代理负责证书管理 (例如 Let's Encrypt). 内部 `forgejo-runner` 实例连接到 `PUBLIC_URL` (应为 `https://`), 信任标准公共 CA.
 
-### One-Time Registration Tokens
+### 一次性注册令牌 (One-Time Registration Tokens)
 
 - 每次任务分发通过 `crypto/rand` 生成唯一注册令牌 (32 字节, 256 位熵).
 - 令牌**一次性使用** -- 首次成功的 `Register` 调用消耗令牌, 后续尝试被拒绝.
 - 令牌在 `REG_TOKEN_TTL` (默认 15 分钟) 后过期.
 - **警告:** `reg_token` 作为 `workflow_dispatch` 输入传递, **在 GitHub Actions workflow 日志中可见**. 作为预防措施, 应在仓库设置中限制对 Actions 日志的访问.
 
-### Secrets Handling
+### 密钥处理 (Secrets Handling)
 
 来自 Forgejo 仓库密钥的传入任务**仅在内存中**保存, 并通过 TLS 连接转发. 绝不会写入磁盘或记录到日志中.
 
@@ -201,14 +201,7 @@ TLS 在反向代理 (Caddy 或 nginx) 处终止. 代理负责证书管理 (例�
 
 Copyright (C) 2026 ShinKouyo <i@0x0f.dev>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+本程序是自由软件: 你可以重新分发和/或修改它, 条款为 Free Software Foundation 发布的 GNU General Public License, 版本 3 或 (按你的选择) 任何更新版本.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
+本程序分发的目的是希望它有用, 但**不提供任何担保**; 甚至不提供适销性或特定用途适用性的默示担保. 详情请参阅 GNU General Public License.
 完整许可证文本见 [COPYING](COPYING).
