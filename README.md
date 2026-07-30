@@ -1,3 +1,5 @@
+**[English](README.md) | 简体中文**
+
 # Forgery
 
 **Forgery** is a Go daemon that acts as a bidirectional proxy between Forgejo and GitHub Actions. It registers with Forgejo as a normal runner, but instead of executing jobs locally, it delegates them to a `forgejo-runner` instance running inside a GitHub Actions workflow.
@@ -162,7 +164,7 @@ forgery/
 ├── templates/
 │   └── forgery-runner.yml
 ├── go.mod / go.sum
-├── COPYING            # GPLv3
+├── COPYING            # GPL-3.0
 └── README.md
 ```
 

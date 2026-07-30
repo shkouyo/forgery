@@ -164,7 +164,7 @@ forgery/
 ├── templates/
 │   └── forgery-runner.yml
 ├── go.mod / go.sum
-├── COPYING            # GPLv3 许可证
+├── COPYING            # GPL-3.0
 └── README.md
 ```
 
@@ -201,7 +201,10 @@ TLS 在反向代理 (Caddy 或 nginx) 处终止. 代理负责证书管理 (例�
 
 Copyright (C) 2026 ShinKouyo <i@0x0f.dev>
 
-本程序是自由软件: 你可以重新分发和/或修改它, 条款为 Free Software Foundation 发布的 GNU General Public License, 版本 3 或 (按你的选择) 任何更新版本.
+本程序为自由软件, 在 Free Software Foundation 发布的 GNU General Public License
+的约束下, 你可以对其进行再发布及修改. 协议版本为第三版或 (按你的选择) 任何更新
+的版本.
 
-本程序分发的目的是希望它有用, 但**不提供任何担保**; 甚至不提供适销性或特定用途适用性的默示担保. 详情请参阅 GNU General Public License.
+本程序分发时希望它有用, 但**不提供任何担保**; 甚至不提供适销性或特定用途适用性
+的默示担保. 详情参见 GNU General Public License.
 完整许可证文本见 [COPYING](COPYING).
