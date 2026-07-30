@@ -1,0 +1,52 @@
+name: forgery-runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_url:
+        description: 'forgery public URL'
+        required: true
+      reg_token:
+        description: 'one-time registration token'
+        required: true
+      labels:
+        description: 'comma-separated runner labels (with :docker://...)'
+        required: true
+      container_image:
+        description: 'default container image'
+        required: false
+      task_id:
+        description: 'Forgejo task id (for logging)'
+        required: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download forgejo-runner
+        run: |
+          # 下载指定版本的 forgejo-runner 二进制
+          # 版本通过环境变量 FORGEJO_RUNNER_VERSION 控制（Actions vars/secrets）
+          RUNNER_VERSION="${FORGEJO_RUNNER_VERSION:-v12.8.0}"
+          curl -sSL "https://code.forgejo.org/forgejo/runner/releases/download/${RUNNER_VERSION}/forgejo-runner-${RUNNER_VERSION}-linux-amd64" \
+            -o /usr/local/bin/forgejo-runner
+          chmod +x /usr/local/bin/forgejo-runner
+
+      - name: Generate runner config
+        run: |
+          mkdir -p /tmp/forgejo-runner
+          cat > /tmp/forgejo-runner/config.yml <<EOF
+          runner:
+            labels:
+          ${{ inputs.labels }}
+          EOF
+
+      - name: Run forgejo-runner one-job
+        run: |
+          forgejo-runner one-job \
+            --config /tmp/forgejo-runner/config.yml \
+            register \
+              --name "forgery-worker-${{ inputs.task_id }}" \
+              --token "${{ inputs.reg_token }}" \
+              --instance "${{ inputs.proxy_url }}" \
+              --ephemeral

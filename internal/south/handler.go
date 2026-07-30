@@ -1,0 +1,249 @@
+// Package south implements the southbound server — forgery acting as a Forgejo
+// Actions instance for the internal forgejo-runner. It implements the
+// RunnerServiceHandler interface (Connect protocol) and authenticates internal
+// runners via one-time registration tokens and session bearer tokens.
+//
+// The south package does NOT import the north package directly. Forwarding of
+// UpdateTask/UpdateLog is done through the northForwarder interface, which is
+// satisfied by north.Client in the main assembly.
+package south
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	v1 "code.gitea.io/actions-proto-go/runner/v1"
+	"code.gitea.io/actions-proto-go/runner/v1/runnerv1connect"
+	"connectrpc.com/connect"
+
+	"git.0x0f.dev/forgery/internal/config"
+	"git.0x0f.dev/forgery/internal/session"
+	"git.0x0f.dev/forgery/internal/store"
+)
+
+// northForwarder is the interface for forwarding UpdateTask and UpdateLog
+// requests to the real Forgejo instance. south does NOT import the north
+// package directly — the concrete north.Client is injected by main.
+type northForwarder interface {
+	ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error)
+	ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error)
+}
+
+// Handler implements the Connect RunnerServiceHandler for the southbound
+// server. Each method corresponds to an RPC that the internal forgejo-runner
+// calls: Register, Declare, FetchTask, UpdateTask, UpdateLog.
+type Handler struct {
+	runnerv1connect.UnimplementedRunnerServiceHandler
+
+	store    store.TaskStore
+	sessions *session.Manager
+	forward  northForwarder
+	cfg      *config.Config
+	log      *slog.Logger
+}
+
+// NewHandler creates a new south Handler with the given dependencies.
+func NewHandler(s store.TaskStore, sm *session.Manager, fw northForwarder, cfg *config.Config, log *slog.Logger) *Handler {
+	return &Handler{
+		store:    s,
+		sessions: sm,
+		forward:  fw,
+		cfg:      cfg,
+		log:      log,
+	}
+}
+
+// bearerFromRequest extracts a Bearer token from the Authorization header of a
+// Connect request. Returns the token and true if found; "", false otherwise.
+func bearerFromRequest(req connect.AnyRequest) (string, bool) {
+	auth := req.Header().Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return "", false
+	}
+	return strings.TrimPrefix(auth, "Bearer "), true
+}
+
+// Register handles the Register RPC. The internal runner presents a one-time
+// registration token that forgery generated when the task was dispatched. If
+// valid (exists, not expired, not already consumed), a new session is created
+// and a session token is returned.
+func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.RegisterRequest]) (*connect.Response[v1.RegisterResponse], error) {
+	regToken := req.Msg.GetToken()
+
+	// Look up the task context by registration token.
+	taskCtx, ok := h.store.GetByRegToken(regToken)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid registration token"))
+	}
+
+	// Check token expiry.
+	if time.Since(taskCtx.CreatedAt) > h.cfg.RegTokenTTL {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token expired"))
+	}
+
+	// Atomically consume the token — it can only be used once.
+	if err := h.store.MarkRegTokenConsumed(regToken); err != nil {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token already consumed"))
+	}
+
+	// Create a session (generates a session token internally).
+	sess := h.sessions.Create(taskCtx, req.Msg.GetName(), req.Msg.GetLabels())
+
+	// Mark the runner as registered (transitions status to Running).
+	taskCtx.MarkRunnerRegistered()
+
+	h.log.Info("runner registered",
+		"runner_name", req.Msg.GetName(),
+		"task_id", taskCtx.ID,
+	)
+
+	return connect.NewResponse(&v1.RegisterResponse{
+		Runner: &v1.Runner{
+			Id:        taskCtx.ID,
+			Token:     sess.SessionToken,
+			Ephemeral: true,
+			Labels:    sess.Labels,
+		},
+	}), nil
+}
+
+// Declare handles the Declare RPC. The internal runner announces its version
+// and labels before fetching a task. The session token from Register is
+// validated via the Authorization header.
+func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRequest]) (*connect.Response[v1.DeclareResponse], error) {
+	sessionToken, ok := bearerFromRequest(req)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+	}
+
+	sess, ok := h.sessions.Lookup(sessionToken)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	}
+
+	h.log.Info("runner declared",
+		"runner_name", sess.RunnerName,
+		"version", req.Msg.GetVersion(),
+		"task_id", sess.TaskCtx.ID,
+	)
+
+	return connect.NewResponse(&v1.DeclareResponse{
+		Runner: &v1.Runner{
+			Id:     sess.TaskCtx.ID,
+			Labels: sess.Labels,
+		},
+	}), nil
+}
+
+// FetchTask handles the FetchTask RPC. The internal runner polls for its task.
+// In the one-job model, the task is returned on the first call. Subsequent
+// calls return an empty response (defensive — an ephemeral runner should not
+// poll again after receiving a task).
+func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTaskRequest]) (*connect.Response[v1.FetchTaskResponse], error) {
+	sessionToken, ok := bearerFromRequest(req)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+	}
+
+	sess, ok := h.sessions.Lookup(sessionToken)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	}
+
+	h.log.Info("task fetched",
+		"task_id", sess.TaskCtx.ID,
+		"runner_name", sess.RunnerName,
+	)
+
+	return connect.NewResponse(&v1.FetchTaskResponse{
+		Task: sess.TaskCtx.Task,
+	}), nil
+}
+
+// UpdateTask handles the UpdateTask RPC. The internal runner reports task
+// status (running, success, failure, etc.). The request is transparently
+// forwarded to the real Forgejo instance. If the task has reached a terminal
+// state, the session and store entry are cleaned up.
+func (h *Handler) UpdateTask(ctx context.Context, req *connect.Request[v1.UpdateTaskRequest]) (*connect.Response[v1.UpdateTaskResponse], error) {
+	sessionToken, ok := bearerFromRequest(req)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+	}
+
+	sess, ok := h.sessions.Lookup(sessionToken)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	}
+
+	// Verify the task ID matches the session's task.
+	taskID := req.Msg.GetState().GetId()
+	if taskID != sess.TaskCtx.ID {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			fmt.Errorf("task_id mismatch: expected %d, got %d", sess.TaskCtx.ID, taskID))
+	}
+
+	// Forward to the real Forgejo instance.
+	resp, err := h.forward.ForwardUpdateTask(ctx, req.Msg)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the result indicates a terminal state, clean up session and store.
+	result := req.Msg.GetState().GetResult()
+	if result != v1.Result_RESULT_UNSPECIFIED {
+		taskCtx := sess.TaskCtx
+		taskCtx.SetStatus(store.StatusTerminal)
+		taskCtx.MarkDone()
+		h.sessions.Remove(sessionToken)
+		h.store.Remove(taskCtx.ID)
+
+		h.log.Info("task terminal, cleaned up",
+			"task_id", taskCtx.ID,
+			"result", result.String(),
+		)
+	}
+
+	return connect.NewResponse(resp), nil
+}
+
+// UpdateLog handles the UpdateLog RPC. The internal runner streams log rows,
+// which are transparently forwarded to the real Forgejo instance.
+func (h *Handler) UpdateLog(ctx context.Context, req *connect.Request[v1.UpdateLogRequest]) (*connect.Response[v1.UpdateLogResponse], error) {
+	sessionToken, ok := bearerFromRequest(req)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+	}
+
+	sess, ok := h.sessions.Lookup(sessionToken)
+	if !ok {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	}
+
+	// Verify the task ID matches the session's task.
+	if req.Msg.GetTaskId() != sess.TaskCtx.ID {
+		return nil, connect.NewError(connect.CodeInvalidArgument,
+			fmt.Errorf("task_id mismatch: expected %d, got %d", sess.TaskCtx.ID, req.Msg.GetTaskId()))
+	}
+
+	// Forward to the real Forgejo instance.
+	resp, err := h.forward.ForwardUpdateLog(ctx, req.Msg)
+	if err != nil {
+		return nil, err
+	}
+
+	return connect.NewResponse(resp), nil
+}
+
+// NewServer creates an HTTP server that serves the Connect RunnerServiceHandler
+// on the given address. The returned server is configured with the handler's
+// mux and is ready to be started with ListenAndServe.
+func NewServer(handler *Handler, addr string) *http.Server {
+	mux := http.NewServeMux()
+	path, h := runnerv1connect.NewRunnerServiceHandler(handler)
+	mux.Handle(path, h)
+	return &http.Server{Addr: addr, Handler: mux}
+}
