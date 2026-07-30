@@ -1,8 +1,5 @@
-// Package observability provides structured logging, metrics, and health checks
-// for the forgery daemon.
-//
-// MVP (Phase 1) implements only slog-based structured logging.
-// Prometheus metrics (metrics.go) and health checks (health.go) are Phase 2.
+// Package observability provides structured logging via slog
+// and a simple health-check HTTP endpoint.
 package observability
 
 import (

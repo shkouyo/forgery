@@ -8,7 +8,7 @@ package config
 import (
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -113,12 +113,13 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// MustLoad calls Load and calls log.Fatal on error.
+// MustLoad calls Load and logs the error via slog, then exits.
 // Useful for main() where there is no recovery from missing configuration.
-func MustLoad() *Config {
+func MustLoad(log *slog.Logger) *Config {
 	cfg, err := Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		log.Error("config load failed", "err", err.Error())
+		os.Exit(1)
 	}
 	return cfg
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,34 +20,39 @@ import (
 
 func main() {
 	// 1. Load configuration
-	cfg := config.MustLoad()
+	// 1.1 Default logger
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	// 2. Initialize structured logging
-	logger := observability.NewLogger(cfg.LogLevel, cfg.LogFormat)
-	logger.Info("starting forgery", "listen_addr", cfg.ListenAddr, "forgejo_url", cfg.ForgejoURL)
+	// 1.2 Config
+	cfg := config.MustLoad(logger)
 
-	// 3. Initialize store (in-memory task store)
+	// 1.3 Structured logger
+	logger = observability.NewLogger(cfg.LogLevel, cfg.LogFormat)
+	logger.Info("starting forgery", "addr", cfg.ListenAddr, "forgejo_url", cfg.ForgejoURL)
+
+	// 2. Store
 	taskStore := store.NewMemStore()
 
-	// 4. Initialize north client (forgery → Forgejo)
+	// 3. North client
 	northClient := north.New(cfg, taskStore, cfg.MaxParallelTasks, logger)
 
-	// 5. Initialize GitHub Actions dispatcher
+	// 4. Dispatcher
 	dispatcher := dispatch.NewDispatcher(cfg, logger)
 
-	// 6. Initialize session manager
+	// 5. Session manager
 	sessionMgr := session.NewManager()
 
-	// 7. Initialize south handler (serves internal runner)
+	// 6. South handler
 	southHandler := south.NewHandler(taskStore, sessionMgr, northClient, cfg, logger)
 
-	// 8. Create south HTTP server
+	// 7. South HTTP server
 	srv := south.NewServer(southHandler, cfg.ListenAddr)
 
-	// 9. Create Runner for task lifecycle management (replaces direct dispatch)
+	// 8. Runner
 	runner := run.New(cfg, northClient, dispatcher, taskStore, logger)
 
-	// 10. Start south HTTP server in goroutine
+	// 9. Background services
+	// 9.1 South HTTP server
 	go func() {
 		logger.Info("south HTTP server starting", "addr", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -54,20 +60,16 @@ func main() {
 		}
 	}()
 
-	// 10a. Initialize metrics (Prometheus-style JSON at /metrics)
-	metrics := observability.NewMetrics()
-	observability.StartMetricsServer(cfg.MetricsAddr, metrics)
-
-	// 10b. Initialize health checks (Kubernetes-style /healthz + /readyz)
+	// 9.2 Health checks
 	healthChecker := observability.NewHealthChecker()
 	observability.StartHealthServer(cfg.HealthAddr, healthChecker)
 
-
-	// 11. Create context for all background work
+	// 10. Forgejo registration
+	// 10.1 Context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 11a. Register and declare with Forgejo before polling
+	// 10.2 Register & declare
 	logger.Info("registering runner with Forgejo")
 	if err := northClient.Register(ctx); err != nil {
 		logger.Error("runner registration failed", "err", err)
@@ -79,18 +81,17 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("runner registered successfully")
-	healthChecker.SetReady(true)
 	taskCh := make(chan *store.TaskCtx, cfg.MaxParallelTasks)
 	go northClient.PollLoop(ctx, taskCh)
 
-	// 13. Task dispatch loop using Runner
+	// 11. Task dispatch
 	go func() {
 		for taskCtx := range taskCh {
 			go runner.HandleTask(ctx, taskCtx)
 		}
 	}()
 
-	// 14. Wait for shutdown signal
+	// 12. Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh

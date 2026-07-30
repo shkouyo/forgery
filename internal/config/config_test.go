@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -618,14 +619,15 @@ func TestPublicURLDefault(t *testing.T) {
 func TestMustLoad(t *testing.T) {
 	// MustLoad should not panic when all required vars are set.
 	setAllRequired(t)
-	cfg := MustLoad()
+	cfg := MustLoad(slog.Default())
 	if cfg == nil {
 		t.Fatal("MustLoad returned nil")
 	}
 }
 
-// Note: MustLoad with missing config calls log.Fatal, which we can't easily test
-// without replacing the logger. That's tested implicitly via Load's error path.
+// Note: MustLoad with missing config uses the provided logger + os.Exit,
+// which we can't easily test without replacing log/slog. That's tested
+// implicitly via Load's error path.
 
 func TestMissingFieldsHelper(t *testing.T) {
 	// Test that MissingFields returns nil for non-validation errors.

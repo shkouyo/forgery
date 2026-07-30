@@ -16,20 +16,16 @@ import (
 type TaskStatus int
 
 const (
-	// StatusPending is the initial state after the task is pulled from Forgejo.
-	// The workflow_dispatch has not yet been sent.
+	// StatusPending — initial state, workflow_dispatch not yet sent.
 	StatusPending TaskStatus = iota
 
-	// StatusDispatched means the workflow_dispatch was successfully sent to
-	// GitHub Actions and forgery is waiting for the internal runner to register.
+	// StatusDispatched — workflow_dispatch sent, waiting for runner.
 	StatusDispatched
 
-	// StatusRunning means the internal forgejo-runner has registered and
-	// connected. The task is actively executing.
+	// StatusRunning — internal runner connected, task executing.
 	StatusRunning
 
-	// StatusTerminal is the final state. The task completed with success,
-	// failure, or was cancelled.
+	// StatusTerminal — task completed (success, failure, or cancelled).
 	StatusTerminal
 )
 
@@ -97,14 +93,21 @@ func (t *TaskCtx) MarkRunnerRegistered() {
 	t.RunnerRegisteredAt = time.Now()
 }
 
+// ensureDone lazily initialises and returns the done channel.
+// The caller must hold t.mu.
+func (t *TaskCtx) ensureDone() chan struct{} {
+	if t.done == nil {
+		t.done = make(chan struct{})
+	}
+	return t.done
+}
+
 // MarkDone closes the done channel exactly once to signal that the task has
 // reached a terminal state. Safe to call multiple times (idempotent).
 func (t *TaskCtx) MarkDone() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.done == nil {
-		t.done = make(chan struct{})
-	}
+	t.ensureDone()
 	select {
 	case <-t.done:
 		// already closed
@@ -117,10 +120,7 @@ func (t *TaskCtx) MarkDone() {
 // Callers can select on this channel to be notified of task completion.
 func (t *TaskCtx) Done() <-chan struct{} {
 	t.mu.Lock()
-	if t.done == nil {
-		t.done = make(chan struct{})
-	}
-	d := t.done
+	d := t.ensureDone()
 	t.mu.Unlock()
 	return d
 }

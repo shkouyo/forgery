@@ -19,6 +19,7 @@ import (
 
 	"git.0x0f.dev/forgery/internal/config"
 	"git.0x0f.dev/forgery/internal/store"
+	"git.0x0f.dev/forgery/internal/version"
 )
 
 // Dispatcher sends workflow_dispatch requests to the GitHub Actions API
@@ -31,7 +32,7 @@ type Dispatcher struct {
 }
 
 // NewDispatcher creates a Dispatcher with a 30-second HTTP client timeout
-// and the forgery/1.0.0 User-Agent header.
+// and the forgery/<version> User-Agent header.
 func NewDispatcher(cfg *config.Config, log *slog.Logger) *Dispatcher {
 	return &Dispatcher{
 		client: &http.Client{
@@ -144,7 +145,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx) error
 
 	req.Header.Set("Authorization", "Bearer "+d.cfg.GitHubToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "forgery/1.0.0")
+	req.Header.Set("User-Agent", "forgery/"+version.Version)
 
 	d.log.Debug("triggering workflow_dispatch",
 		"url", url,
@@ -161,7 +162,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx) error
 	if resp.StatusCode == http.StatusNoContent {
 		d.log.Info("workflow_dispatch triggered",
 			"task_id", taskCtx.ID,
-			"status", resp.StatusCode,
+			"http_status", resp.StatusCode,
 		)
 		return nil
 	}
@@ -172,7 +173,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx) error
 
 	d.log.Error("workflow_dispatch failed",
 		"task_id", taskCtx.ID,
-		"status", resp.StatusCode,
+		"http_status", resp.StatusCode,
 		"body", string(respBody),
 	)
 

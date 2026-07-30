@@ -18,6 +18,7 @@ import (
 
 	"git.0x0f.dev/forgery/internal/config"
 	"git.0x0f.dev/forgery/internal/store"
+	"git.0x0f.dev/forgery/internal/version"
 )
 
 // Client is the northbound client that connects to the real Forgejo instance.
@@ -77,7 +78,7 @@ func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logge
 			} else {
 				req.Header().Set("x-runner-token", cfg.ForgejoRunnerToken)
 			}
-			req.Header().Set("x-runner-version", "1.0.0")
+			req.Header().Set("x-runner-version", version.Version)
 			if c.runnerUUID != "" {
 				req.Header().Set("x-runner-uuid", c.runnerUUID)
 			}
@@ -97,6 +98,9 @@ func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logge
 	return c
 }
 
+// stripContainerMapping removes the container image mapping suffix
+// from each label. Forgejo expects bare label names; the full
+// mapping is still used for GitHub Actions dispatch.
 func stripContainerMapping(labels []string) []string {
 	out := make([]string, len(labels))
 	for i, l := range labels {
@@ -120,7 +124,7 @@ func (c *Client) Register(ctx context.Context) error {
 		Token:   c.cfg.ForgejoRunnerToken,
 		Name:    c.cfg.ForgejoRunnerName,
 		Labels:  stripContainerMapping(c.cfg.ForgejoRunnerLabels),
-		Version: "1.0.0",
+		Version: version.Version,
 	})
 	resp, err := c.client.Register(ctx, req)
 	if err != nil {
@@ -140,7 +144,7 @@ func (c *Client) Register(ctx context.Context) error {
 func (c *Client) Declare(ctx context.Context) error {
 	req := connect.NewRequest(&v1.DeclareRequest{
 		Labels:  stripContainerMapping(c.cfg.ForgejoRunnerLabels),
-		Version: "1.0.0",
+		Version: version.Version,
 	})
 	_, err := c.client.Declare(ctx, req)
 	return err

@@ -28,6 +28,9 @@ import (
 // northForwarder is the interface for forwarding UpdateTask and UpdateLog
 // requests to the real Forgejo instance. south does NOT import the north
 // package directly — the concrete north.Client is injected by main.
+//
+// See also: internal/run/runner.go's northClient interface.
+// Both interfaces describe overlapping subsets of the same north.Client type.
 type northForwarder interface {
 	ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error)
 	ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error)
@@ -101,8 +104,7 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid registration token"))
 	}
 
-	// Check token expiry.
-	if time.Since(taskCtx.CreatedAt) > h.cfg.RegTokenTTL {
+	if h.isRegTokenExpired(taskCtx) {
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token expired"))
 	}
 
@@ -117,15 +119,12 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 	// Mark the runner as registered (transitions status to Running).
 	taskCtx.MarkRunnerRegistered()
 
-	sessionTokenPreview := sess.SessionToken
-	if len(sessionTokenPreview) > 8 {
-		sessionTokenPreview = sessionTokenPreview[:8]
-	}
+	sessionTokenPreview := truncateToken(sess.SessionToken)
 	h.log.Info("runner registered",
 		"runner_name", req.Msg.GetName(),
 		"task_id", taskCtx.ID,
-		"session_token_prefix", sessionTokenPreview,
-		"session_token_len", len(sess.SessionToken),
+		"token_prefix", sessionTokenPreview,
+		"token_len", len(sess.SessionToken),
 	)
 	return connect.NewResponse(&v1.RegisterResponse{
 		Runner: &v1.Runner{
@@ -150,10 +149,7 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
 	}
 
-	tokenPreview := token
-	if len(tokenPreview) > 8 {
-		tokenPreview = tokenPreview[:8]
-	}
+	tokenPreview := truncateToken(token)
 
 	// Try session token first (normal path after explicit Register).
 	sess, ok := h.sessions.Lookup(token)
@@ -171,8 +167,7 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
 	}
 
-	// Check token expiry.
-	if time.Since(taskCtx.CreatedAt) > h.cfg.RegTokenTTL {
+	if h.isRegTokenExpired(taskCtx) {
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token expired"))
 	}
 
@@ -322,6 +317,19 @@ func (h *Handler) UpdateLog(ctx context.Context, req *connect.Request[v1.UpdateL
 	}
 
 	return connect.NewResponse(resp), nil
+}
+
+// truncateToken truncates a string to 8 characters for safe logging.
+func truncateToken(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
+}
+
+// isRegTokenExpired checks whether the registration token has exceeded its TTL.
+func (h *Handler) isRegTokenExpired(tc *store.TaskCtx) bool {
+	return time.Since(tc.CreatedAt) > h.cfg.RegTokenTTL
 }
 
 // NewServer creates an HTTP server that serves the Connect RunnerServiceHandler

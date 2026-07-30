@@ -29,11 +29,9 @@ func (c *Client) PollLoop(ctx context.Context, taskCh chan<- *store.TaskCtx) {
 		// additional FetchTask calls — Forgejo will not assign
 		// new tasks to a runner that isn't asking for them.
 		//
-		// TODO(Phase 2): when cfg.PingKeepalive is true, if
-		// acquisition blocks for >60s the goroutine should send
-		// a Ping RPC to prevent Forgejo from marking the runner
-		// offline. For the MVP the ctx cancellation path is
-		// sufficient to avoid indefinite stalls.
+		// NOTE: cfg.PingKeepalive enables a keepalive Ping RPC when
+		// acquisition blocks for >60s, but the Ping RPC is not yet
+		// implemented. Only ctx cancellation prevents indefinite stalls.
 		select {
 		case c.sem <- struct{}{}: // acquire slot
 		case <-ctx.Done():
@@ -78,6 +76,8 @@ func (c *Client) PollLoop(ctx context.Context, taskCh chan<- *store.TaskCtx) {
 		taskCtx.SetStatus(store.StatusPending)
 
 		c.store.PutPending(taskCtx)
+
+		c.log.Info("task received from Forgejo", "task_id", resp.Msg.Task.Id)
 
 		// ── Send task to run layer ──
 		// Slot is NOT released here — the run module will call

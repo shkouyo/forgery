@@ -19,6 +19,9 @@ import (
 
 // northClient is the subset of north.Client methods that the run module uses.
 // Using an interface allows mocking in tests.
+//
+// See also: internal/south/handler.go's northForwarder interface.
+// Both interfaces describe overlapping subsets of the same north.Client type.
 type northClient interface {
 	ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error)
 	ReleaseSlot()
@@ -56,6 +59,16 @@ func New(cfg *config.Config, nc *north.Client, dp *dispatch.Dispatcher, st store
 	}
 }
 
+// failureUpdateRequest builds an UpdateTaskRequest with RESULT_FAILURE for the given task ID.
+func failureUpdateRequest(taskID int64) *v1.UpdateTaskRequest {
+	return &v1.UpdateTaskRequest{
+		State: &v1.TaskState{
+			Id:     taskID,
+			Result: v1.Result_RESULT_FAILURE,
+		},
+	}
+}
+
 // HandleTask orchestrates the lifecycle of a single task.
 //
 // Flow:
@@ -73,12 +86,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		r.log.Error("dispatch failed", "task_id", taskCtx.ID, "err", err)
 
 		// Report failure to Forgejo.
-		r.north.ForwardUpdateTask(ctx, &v1.UpdateTaskRequest{
-			State: &v1.TaskState{
-				Id:     taskCtx.ID,
-				Result: v1.Result_RESULT_FAILURE,
-			},
-		})
+		r.north.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
 
 		// Release backpressure slot.
 		r.north.ReleaseSlot()
@@ -117,12 +125,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		hbCancel()
 
 		// Report failure to Forgejo.
-		r.north.ForwardUpdateTask(ctx, &v1.UpdateTaskRequest{
-			State: &v1.TaskState{
-				Id:     taskCtx.ID,
-				Result: v1.Result_RESULT_FAILURE,
-			},
-		})
+		r.north.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
 
 		// Clean up.
 		r.north.ReleaseSlot()
