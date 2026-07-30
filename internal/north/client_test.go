@@ -549,5 +549,53 @@ func TestStartHeartbeat_StopsOnCancel(t *testing.T) {
 	if callCount != callsBeforeCancel {
 		t.Errorf("heartbeat continued after cancellation: %d calls before, %d after",
 			callsBeforeCancel, callCount)
+		}
+	}
+
+func TestStripContainerMapping(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  []string
+		want   []string
+	}{
+		{
+			name:  "no colons",
+			input: []string{"ubuntu-latest", "debian-bookworm"},
+			want:  []string{"ubuntu-latest", "debian-bookworm"},
+		},
+		{
+			name:  "with container mappings",
+			input: []string{"ubuntu-latest:docker://node:20-bookworm", "docker:docker://ghcr.io/catthehacker/ubuntu:act-latest"},
+			want:  []string{"ubuntu-latest", "docker"},
+		},
+		{
+			name:  "mixed",
+			input: []string{"linux", "ubuntu-latest:docker://node:20"},
+			want:  []string{"linux", "ubuntu-latest"},
+		},
+		{
+			name:  "empty input",
+			input: []string{},
+			want:  []string{},
+		},
+		{
+			name:  "nil input",
+			input: nil,
+			want:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripContainerMapping(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("got[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

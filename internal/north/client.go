@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	v1 "code.gitea.io/actions-proto-go/runner/v1"
@@ -96,6 +97,18 @@ func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logge
 	return c
 }
 
+func stripContainerMapping(labels []string) []string {
+	out := make([]string, len(labels))
+	for i, l := range labels {
+		if idx := strings.IndexByte(l, ':'); idx >= 0 {
+			out[i] = l[:idx]
+		} else {
+			out[i] = l
+		}
+	}
+	return out
+}
+
 // Register calls the Forgejo Register RPC with the configured runner
 // token, name, labels, and version. It must be called once at startup
 // before Declare or FetchTask.
@@ -106,7 +119,7 @@ func (c *Client) Register(ctx context.Context) error {
 	req := connect.NewRequest(&v1.RegisterRequest{
 		Token:   c.cfg.ForgejoRunnerToken,
 		Name:    c.cfg.ForgejoRunnerName,
-		Labels:  c.cfg.ForgejoRunnerLabels,
+		Labels:  stripContainerMapping(c.cfg.ForgejoRunnerLabels),
 		Version: "1.0.0",
 	})
 	resp, err := c.client.Register(ctx, req)
@@ -126,7 +139,7 @@ func (c *Client) Register(ctx context.Context) error {
 // for tasks.
 func (c *Client) Declare(ctx context.Context) error {
 	req := connect.NewRequest(&v1.DeclareRequest{
-		Labels:  c.cfg.ForgejoRunnerLabels,
+		Labels:  stripContainerMapping(c.cfg.ForgejoRunnerLabels),
 		Version: "1.0.0",
 	})
 	_, err := c.client.Declare(ctx, req)
