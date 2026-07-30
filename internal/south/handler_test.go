@@ -173,13 +173,18 @@ func setBearer[T any](req *connect.Request[T], token string) {
 	req.Header().Set("Authorization", "Bearer "+token)
 }
 
-// ── Tests: bearerFromRequest ───────────────────────────────────────────────
+// setRunnerToken sets the x-runner-token header on a connect request.
+func setRunnerToken[T any](req *connect.Request[T], token string) {
+	req.Header().Set("x-runner-token", token)
+}
 
-func TestBearerFromRequest_Valid(t *testing.T) {
+// ── Tests: sessionTokenFromRequest ──────────────────────────────────────────
+
+func TestSessionTokenFromRequest_Bearer(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	setBearer(req, "my-secret-token")
 
-	tok, ok := bearerFromRequest(req)
+	tok, ok := sessionTokenFromRequest(req)
 	if !ok {
 		t.Fatal("expected ok=true for valid bearer")
 	}
@@ -188,35 +193,78 @@ func TestBearerFromRequest_Valid(t *testing.T) {
 	}
 }
 
-func TestBearerFromRequest_NoHeader(t *testing.T) {
+func TestSessionTokenFromRequest_RunnerToken(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
+	setRunnerToken(req, "runner-session-token")
 
-	_, ok := bearerFromRequest(req)
-	if ok {
-		t.Fatal("expected ok=false when no Authorization header")
+	tok, ok := sessionTokenFromRequest(req)
+	if !ok {
+		t.Fatal("expected ok=true for x-runner-token header")
+	}
+	if tok != "runner-session-token" {
+		t.Fatalf("expected token 'runner-session-token', got %q", tok)
 	}
 }
 
-func TestBearerFromRequest_NotBearer(t *testing.T) {
+func TestSessionTokenFromRequest_RunnerTokenPreferred(t *testing.T) {
+	// x-runner-token should be preferred over Authorization: Bearer
+	req := connect.NewRequest(&v1.DeclareRequest{})
+	setRunnerToken(req, "runner-token")
+	setBearer(req, "bearer-token")
+
+	tok, ok := sessionTokenFromRequest(req)
+	if !ok {
+		t.Fatal("expected ok=true when both headers are present")
+	}
+	if tok != "runner-token" {
+		t.Fatalf("expected x-runner-token to take precedence, got %q", tok)
+	}
+}
+
+func TestSessionTokenFromRequest_NoHeader(t *testing.T) {
+	req := connect.NewRequest(&v1.DeclareRequest{})
+
+	_, ok := sessionTokenFromRequest(req)
+	if ok {
+		t.Fatal("expected ok=false when no headers")
+	}
+}
+
+func TestSessionTokenFromRequest_NotBearer(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	req.Header().Set("Authorization", "Basic YWxhZGRpbjpvcGVuc2VzYW1l")
 
-	_, ok := bearerFromRequest(req)
+	_, ok := sessionTokenFromRequest(req)
 	if ok {
 		t.Fatal("expected ok=false for non-Bearer scheme")
 	}
 }
 
-func TestBearerFromRequest_EmptyBearer(t *testing.T) {
+func TestSessionTokenFromRequest_EmptyBearer(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	req.Header().Set("Authorization", "Bearer ")
 
-	tok, ok := bearerFromRequest(req)
+	tok, ok := sessionTokenFromRequest(req)
 	if !ok {
 		t.Fatal("expected ok=true for Bearer prefix")
 	}
 	if tok != "" {
 		t.Fatalf("expected empty token, got %q", tok)
+	}
+}
+
+func TestSessionTokenFromRequest_EmptyRunnerToken(t *testing.T) {
+	// Empty x-runner-token should fall through to Authorization header
+	req := connect.NewRequest(&v1.DeclareRequest{})
+	req.Header().Set("x-runner-token", "")
+	setBearer(req, "fallback-token")
+
+	tok, ok := sessionTokenFromRequest(req)
+	if !ok {
+		t.Fatal("expected ok=true when x-runner-token is empty but bearer is present")
+	}
+	if tok != "fallback-token" {
+		t.Fatalf("expected fallback bearer token, got %q", tok)
 	}
 }
 
@@ -393,7 +441,37 @@ func TestDeclare_InvalidSession(t *testing.T) {
 	}
 }
 
-func TestDeclare_MissingBearer(t *testing.T) {
+func TestDeclare_ValidSessionRunnerToken(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	fw := newMockForwarder()
+	h := newTestHandler(ms, sm, fw)
+
+	regToken := "declare-runner-token-test"
+	taskCtx := newTaskCtx(ms, 42, regToken)
+	taskCtx.CreatedAt = time.Now()
+
+	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner", Labels: []string{"linux"}})
+	regResp, err := h.Register(context.Background(), regReq)
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	sessionToken := regResp.Msg.GetRunner().GetToken()
+
+	// Declare using x-runner-token header (forgejo-runner v12+ style).
+	declReq := connect.NewRequest(&v1.DeclareRequest{Version: "1.0.0", Labels: []string{"linux"}})
+	setRunnerToken(declReq, sessionToken)
+
+	resp, err := h.Declare(context.Background(), declReq)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Msg.GetRunner() == nil {
+		t.Fatal("expected runner in response")
+	}
+}
+
+func TestDeclare_MissingToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
 	fw := newMockForwarder()
@@ -403,7 +481,7 @@ func TestDeclare_MissingBearer(t *testing.T) {
 
 	_, err := h.Declare(context.Background(), req)
 	if err == nil {
-		t.Fatal("expected error for missing bearer")
+		t.Fatal("expected error for missing session token")
 	}
 	if connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf("expected Unauthenticated, got %v", connect.CodeOf(err))
@@ -465,7 +543,7 @@ func TestFetchTask_InvalidSession(t *testing.T) {
 	}
 }
 
-func TestFetchTask_MissingBearer(t *testing.T) {
+func TestFetchTask_MissingToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
 	fw := newMockForwarder()
@@ -475,7 +553,7 @@ func TestFetchTask_MissingBearer(t *testing.T) {
 
 	_, err := h.FetchTask(context.Background(), req)
 	if err == nil {
-		t.Fatal("expected error for missing bearer")
+		t.Fatal("expected error for missing session token")
 	}
 	if connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf("expected Unauthenticated, got %v", connect.CodeOf(err))
@@ -846,7 +924,7 @@ func TestUpdateLog_InvalidSession(t *testing.T) {
 	}
 }
 
-func TestUpdateLog_MissingBearer(t *testing.T) {
+func TestUpdateLog_MissingToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
 	fw := newMockForwarder()
@@ -856,7 +934,7 @@ func TestUpdateLog_MissingBearer(t *testing.T) {
 
 	_, err := h.UpdateLog(context.Background(), req)
 	if err == nil {
-		t.Fatal("expected error for missing bearer")
+		t.Fatal("expected error for missing session token")
 	}
 	if connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf("expected Unauthenticated, got %v", connect.CodeOf(err))

@@ -57,14 +57,20 @@ func NewHandler(s store.TaskStore, sm *session.Manager, fw northForwarder, cfg *
 	}
 }
 
-// bearerFromRequest extracts a Bearer token from the Authorization header of a
-// Connect request. Returns the token and true if found; "", false otherwise.
-func bearerFromRequest(req connect.AnyRequest) (string, bool) {
-	auth := req.Header().Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return "", false
+// sessionTokenFromRequest extracts a session token from a Connect request.
+// forgejo-runner v12+ sends the token via the x-runner-token header.
+// Falls back to the standard Authorization: Bearer header.
+func sessionTokenFromRequest(req connect.AnyRequest) (string, bool) {
+	// forgejo-runner v12+ sends x-runner-token header
+	if tok := req.Header().Get("x-runner-token"); tok != "" {
+		return tok, true
 	}
-	return strings.TrimPrefix(auth, "Bearer "), true
+	// Fallback: standard Authorization: Bearer header
+	auth := req.Header().Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer "), true
+	}
+	return "", false
 }
 
 // Register handles the Register RPC. The internal runner presents a one-time
@@ -115,11 +121,11 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 
 // Declare handles the Declare RPC. The internal runner announces its version
 // and labels before fetching a task. The session token from Register is
-// validated via the Authorization header.
+// validated via the x-runner-token header or Authorization header.
 func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRequest]) (*connect.Response[v1.DeclareResponse], error) {
-	sessionToken, ok := bearerFromRequest(req)
+	sessionToken, ok := sessionTokenFromRequest(req)
 	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
 	}
 
 	sess, ok := h.sessions.Lookup(sessionToken)
@@ -150,9 +156,9 @@ func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRe
 // calls return an empty response (defensive — an ephemeral runner should not
 // poll again after receiving a task).
 func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTaskRequest]) (*connect.Response[v1.FetchTaskResponse], error) {
-	sessionToken, ok := bearerFromRequest(req)
+	sessionToken, ok := sessionTokenFromRequest(req)
 	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
 	}
 
 	sess, ok := h.sessions.Lookup(sessionToken)
@@ -175,9 +181,9 @@ func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTa
 // forwarded to the real Forgejo instance. If the task has reached a terminal
 // state, the session and store entry are cleaned up.
 func (h *Handler) UpdateTask(ctx context.Context, req *connect.Request[v1.UpdateTaskRequest]) (*connect.Response[v1.UpdateTaskResponse], error) {
-	sessionToken, ok := bearerFromRequest(req)
+	sessionToken, ok := sessionTokenFromRequest(req)
 	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
 	}
 
 	sess, ok := h.sessions.Lookup(sessionToken)
@@ -219,9 +225,9 @@ func (h *Handler) UpdateTask(ctx context.Context, req *connect.Request[v1.Update
 // UpdateLog handles the UpdateLog RPC. The internal runner streams log rows,
 // which are transparently forwarded to the real Forgejo instance.
 func (h *Handler) UpdateLog(ctx context.Context, req *connect.Request[v1.UpdateLogRequest]) (*connect.Response[v1.UpdateLogResponse], error) {
-	sessionToken, ok := bearerFromRequest(req)
+	sessionToken, ok := sessionTokenFromRequest(req)
 	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing bearer token"))
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
 	}
 
 	sess, ok := h.sessions.Lookup(sessionToken)
