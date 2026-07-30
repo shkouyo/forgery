@@ -104,7 +104,9 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 	return connect.NewResponse(&v1.RegisterResponse{
 		Runner: &v1.Runner{
 			Id:        taskCtx.ID,
+			Uuid:      sess.SessionToken,
 			Token:     sess.SessionToken,
+			Name:      req.Msg.GetName(),
 			Ephemeral: true,
 			Labels:    sess.Labels,
 		},
@@ -133,8 +135,12 @@ func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRe
 
 	return connect.NewResponse(&v1.DeclareResponse{
 		Runner: &v1.Runner{
-			Id:     sess.TaskCtx.ID,
-			Labels: sess.Labels,
+			Id:        sess.TaskCtx.ID,
+			Uuid:      sess.SessionToken,
+			Token:     sess.SessionToken,
+			Name:      sess.RunnerName,
+			Ephemeral: true,
+			Labels:    sess.Labels,
 		},
 	}), nil
 }
