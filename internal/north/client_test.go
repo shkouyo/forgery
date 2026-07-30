@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
-
 	v1 "code.gitea.io/actions-proto-go/runner/v1"
 	"code.gitea.io/actions-proto-go/runner/v1/runnerv1connect"
 	"connectrpc.com/connect"
@@ -120,23 +120,30 @@ func (h *mockHandler) UpdateLog(ctx context.Context, req *connect.Request[v1.Upd
 
 // newMockServer creates an httptest.Server with a connect handler wrapping the
 // given mockHandler, and returns the server and a Client connected to it.
+//
+// The server is configured for HTTP/2 (h2c) so that the gRPC-protocol client
+// (used by New) can connect. It also strips the /api/actions prefix that the
+// production client appends to match Forgejo's routing.
 func newMockServer(t *testing.T, h *mockHandler, maxParallel int) (*httptest.Server, *Client) {
 	t.Helper()
 
 	_, muxHandler := runnerv1connect.NewRunnerServiceHandler(h)
-	// The connect handler handles all routing internally using the full
-	// procedure path (e.g. /runner.v1.RunnerService/UpdateTask).
-	// We mount it at the server root and pass the bare server URL as
-	// the base URL; the connect client appends the procedure path.
-	ts := httptest.NewServer(muxHandler)
+	// Strip /api/actions prefix so the handler sees bare procedure paths
+	// like /runner.v1.RunnerService/FetchTask.
+	stripped := http.StripPrefix("/api/actions", muxHandler)
+
+	// Create an unstarted server so we can configure HTTP/2 (h2c) before
+	// starting it. The gRPC protocol requires HTTP/2.
+	ts := httptest.NewUnstartedServer(stripped)
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
 
 	cfg := testConfig(ts.URL)
-	cfg.TLSInsecureSkipVerify = false
+	cfg.TLSInsecureSkipVerify = true // test server uses self-signed cert
 	c := New(cfg, store.NewMemStore(), maxParallel, testLogger())
 
 	return ts, c
 }
-
 // ── TestForwardUpdateTask ────────────────────────────────────────────────────
 
 func TestForwardUpdateTask(t *testing.T) {

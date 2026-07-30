@@ -32,20 +32,32 @@ type Client struct {
 
 // New creates a new northbound Client.
 //
-// It constructs a net/http.Client with TLS configuration from cfg
-// and wraps it with the Connect-generated RunnerServiceClient.
+// It constructs a net/http.Client with HTTP/2 support (required for gRPC)
+// and wraps it with the Connect-generated RunnerServiceClient configured
+// to speak gRPC protocol. The base URL has /api/actions appended because
+// Forgejo mounts the runner service at that path prefix.
 // maxParallel controls the backpressure semaphore capacity.
 func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logger) *Client {
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: cfg.TLSInsecureSkipVerify, // #nosec G402
-			},
-		},
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: cfg.TLSInsecureSkipVerify, // #nosec G402
 	}
+	// Enable HTTP/2 over cleartext (h2c) for non-TLS endpoints (tests, dev).
+	// Production TLS connections negotiate HTTP/2 via ALPN automatically.
+	if baseTransport.Protocols == nil {
+		baseTransport.Protocols = new(http.Protocols)
+		baseTransport.Protocols.SetHTTP1(true)
+		baseTransport.Protocols.SetHTTP2(true)
+	}
+	baseTransport.Protocols.SetUnencryptedHTTP2(true)
+
+	httpClient := &http.Client{Transport: baseTransport}
+
+	// Forgejo mounts the runner gRPC service at /api/actions/.
+	runnerURL := cfg.ForgejoURL + "/api/actions"
 
 	return &Client{
-		client: runnerv1connect.NewRunnerServiceClient(httpClient, cfg.ForgejoURL),
+		client: runnerv1connect.NewRunnerServiceClient(httpClient, runnerURL, connect.WithGRPC()),
 		cfg:    cfg,
 		store:  s,
 		sem:    make(chan struct{}, maxParallel),
