@@ -23,12 +23,13 @@ import (
 // It registers as an Actions runner, polls for tasks, and forwards
 // status/log updates from the internal runner back to Forgejo.
 type Client struct {
-	client     runnerv1connect.RunnerServiceClient
-	runnerUUID string // set from Register response, sent as x-runner-uuid header
-	cfg        *config.Config
-	store      store.TaskStore
-	sem        chan struct{} // backpressure semaphore
-	log        *slog.Logger
+	client      runnerv1connect.RunnerServiceClient
+	runnerUUID  string // set from Register response, sent as x-runner-uuid header
+	runnerToken string // permanent runner token from Register response, sent as x-runner-token header
+	cfg         *config.Config
+	store       store.TaskStore
+	sem         chan struct{} // backpressure semaphore
+	log         *slog.Logger
 }
 
 // New creates a new northbound Client.
@@ -68,7 +69,13 @@ func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logge
 	// included. The closure captures c so it always reads the latest UUID.
 	authInterceptor := connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
 		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			req.Header().Set("x-runner-token", cfg.ForgejoRunnerToken)
+			// Use the permanent runner token from Register if available,
+			// otherwise fall back to the registration token (needed for Register itself).
+			if c.runnerToken != "" {
+				req.Header().Set("x-runner-token", c.runnerToken)
+			} else {
+				req.Header().Set("x-runner-token", cfg.ForgejoRunnerToken)
+			}
 			req.Header().Set("x-runner-version", "1.0.0")
 			if c.runnerUUID != "" {
 				req.Header().Set("x-runner-uuid", c.runnerUUID)
@@ -106,9 +113,10 @@ func (c *Client) Register(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Save runner UUID for subsequent request headers.
+	// Save runner UUID and permanent token for subsequent request headers.
 	if runner := resp.Msg.GetRunner(); runner != nil {
 		c.runnerUUID = runner.GetUuid()
+		c.runnerToken = runner.GetToken()
 	}
 	return nil
 }
