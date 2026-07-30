@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
@@ -16,7 +18,6 @@ import (
 	"git.0x0f.dev/forgery/internal/session"
 	"git.0x0f.dev/forgery/internal/store"
 )
-
 // ── mockStore ──────────────────────────────────────────────────────────────
 
 // mockStore implements store.TaskStore for testing. It tracks calls and
@@ -908,6 +909,31 @@ func TestNewServer(t *testing.T) {
 	}
 	if srv.Handler == nil {
 		t.Fatal("expected non-nil handler")
+	}
+
+	// Verify the /api/actions/ prefix path is registered by starting a test
+	// server and checking both paths respond (not 404).
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	// The Connect handler at the root path should exist
+	resp, err := http.Get(ts.URL + "/runner.v1.RunnerService/FetchTask")
+	if err != nil {
+		t.Fatalf("root path request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		t.Fatal("root path returned 404")
+	}
+
+	// The Connect handler at /api/actions/ prefix should also exist
+	resp2, err := http.Get(ts.URL + "/api/actions/runner.v1.RunnerService/FetchTask")
+	if err != nil {
+		t.Fatalf("/api/actions/ path request failed: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusNotFound {
+		t.Fatal("/api/actions/ path returned 404")
 	}
 }
 

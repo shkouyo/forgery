@@ -244,6 +244,8 @@ func (h *Handler) UpdateLog(ctx context.Context, req *connect.Request[v1.UpdateL
 func NewServer(handler *Handler, addr string) *http.Server {
 	mux := http.NewServeMux()
 	path, h := runnerv1connect.NewRunnerServiceHandler(handler)
+	// Register at both paths for compatibility with forgejo-runner
 	mux.Handle(path, h)
+	mux.Handle("/api/actions/", http.StripPrefix("/api/actions", h))
 	return &http.Server{Addr: addr, Handler: mux}
 }
