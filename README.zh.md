@@ -33,13 +33,13 @@ cp templates/forgery-runner.yml /path/to/your/repo/.github/workflows/
 创建 `.env` 文件或导出以下环境变量:
 
 ```env
-# Forgejo connection
+# Forgejo 连接
 FORGEJO_URL=https://forgejo.example.com
 FORGEJO_RUNNER_TOKEN=your-runner-registration-token
 FORGEJO_RUNNER_NAME=forgery-proxy
 FORGEJO_RUNNER_LABELS=ubuntu-latest:docker://node:20-bookworm,docker:docker://ghcr.io/catthehacker/ubuntu:act-latest
 
-# GitHub Actions connection
+# GitHub Actions 连接
 GITHUB_TOKEN=github_pat_...
 GITHUB_REPO=your-org/your-repo
 GITHUB_WORKFLOW_ID=forgery-runner.yml
@@ -66,12 +66,12 @@ GITHUB_WORKFLOW_ID=forgery-runner.yml
 
 ### 环境变量参考
 
-| Variable | Required | Default | Description |
+| 变量 | 必填 | 默认值 | 描述 |
 |----------|----------|---------|-------------|
 | `FORGEJO_URL` | Yes | -- | Forgejo 实例基础 URL (例如 `https://forgejo.example.com`) |
 | `FORGEJO_RUNNER_TOKEN` | Yes | -- | Forgejo runner 注册令牌 |
 | `FORGEJO_RUNNER_NAME` | Yes | -- | 在 Forgejo runner 列表中显示的显示名称 |
-| `FORGEJO_RUNNER_LABELS` | Yes | -- | 逗号分隔的标签及可选容器镜像映射 (见 [标签](#标签-labels)) |
+| `FORGEJO_RUNNER_LABELS` | Yes | -- | 逗号分隔的标签及可选容器镜像映射 (见 [标签](#标签)) |
 | `GITHUB_TOKEN` | Yes | -- | 具有 `workflow` 权限的 GitHub 个人访问令牌 (建议使用细粒度仓库作用域令牌) |
 | `GITHUB_REPO` | Yes | -- | 存放 workflow 的仓库, 格式为 `owner/repo` |
 | `GITHUB_WORKFLOW_ID` | Yes | -- | Workflow 文件名 (例如 `forgery-runner.yml`) 或 workflow ID |
@@ -91,7 +91,7 @@ GITHUB_WORKFLOW_ID=forgery-runner.yml
 | `HEALTH_ADDR` | No | -- | 健康检查端点监听地址 (设置后暴露 `/healthz` 和 `/readyz`) |
 | `TLS_INSECURE_SKIP_VERIFY` | No | `false` | 跳过北向连接 TLS 证书验证 (仅开发环境) |
 
-### 标签 (Labels)
+### 标签
 
 `FORGEJO_RUNNER_LABELS` 使用以下格式将 Forgejo `runs-on` 标签映射到容器镜像:
 
@@ -149,22 +149,22 @@ go test ./... -race
 
 ```
 forgery/
-├── cmd/forgery/       # main entry
+├── cmd/forgery/       # 主入口
 ├── internal/
-│   ├── config/        # env var loading and defaults
-│   ├── dispatch/      # GitHub Actions workflow_dispatch
-│   ├── north/         # northbound client (Forgery -> Forgejo)
-│   ├── observability/ # logging and health checks
-│   ├── run/           # per-task orchestration
-│   ├── session/       # session lifecycle
-│   ├── south/         # southbound server (forgejo-runner -> Forgery)
-│   ├── store/         # in-memory task/session storage
-│   ├── token/         # cryptographic token generation
-│   └── version/       # version constant
+│   ├── config/        # 环境变量加载与默认值
+│   ├── dispatch/      # GitHub Actions workflow_dispatch 调用
+│   ├── north/         # 北向客户端 (Forgery -> Forgejo)
+│   ├── observability/ # 日志和健康检查
+│   ├── run/           # 单任务编排
+│   ├── session/       # 会话生命周期
+│   ├── south/         # 南向服务端 (forgejo-runner -> Forgery)
+│   ├── store/         # 内存任务/会话存储
+│   ├── token/         # 加密令牌生成
+│   └── version/       # 版本常量
 ├── templates/
 │   └── forgery-runner.yml
 ├── go.mod / go.sum
-├── COPYING            # GPLv3
+├── COPYING            # GPLv3 许可证
 └── README.md
 ```
 
@@ -172,22 +172,22 @@ forgery/
 
 ## Security
 
-### 北向 (Forgery -> Forgejo)
+### 北向
 
 **Forgery** 通过 HTTPS 连接 Forgejo. 确保 `FORGEJO_URL` 使用 `https://`. 使用自签名证书进行开发时, 设置 `TLS_INSECURE_SKIP_VERIFY=true`.
 
-### 南向 (internal runner -> Forgery)
+### 南向
 
 TLS 在反向代理 (Caddy 或 nginx) 处终止. 代理负责证书管理 (例如 Let's Encrypt). 内部 `forgejo-runner` 实例连接到 `PUBLIC_URL` (应为 `https://`), 信任标准公共 CA.
 
-### 一次性注册令牌 (One-Time Registration Tokens)
+### 一次性注册令牌
 
 - 每次任务分发通过 `crypto/rand` 生成唯一注册令牌 (32 字节, 256 位熵).
 - 令牌**一次性使用** -- 首次成功的 `Register` 调用消耗令牌, 后续尝试被拒绝.
 - 令牌在 `REG_TOKEN_TTL` (默认 15 分钟) 后过期.
 - **警告:** `reg_token` 作为 `workflow_dispatch` 输入传递, **在 GitHub Actions workflow 日志中可见**. 作为预防措施, 应在仓库设置中限制对 Actions 日志的访问.
 
-### 密钥处理 (Secrets Handling)
+### 密钥处理
 
 来自 Forgejo 仓库密钥的传入任务**仅在内存中**保存, 并通过 TLS 连接转发. 绝不会写入磁盘或记录到日志中.
 
