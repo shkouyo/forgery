@@ -56,8 +56,15 @@ func (m *Manager) Create(taskCtx *store.TaskCtx, runnerName string, labels []str
 		panic("session: failed to generate token: " + err.Error())
 	}
 
-	sessionToken := hex.EncodeToString(raw)
+	return m.CreateWithToken(taskCtx, hex.EncodeToString(raw), runnerName, labels)
+}
 
+// CreateWithToken creates a session with an explicit session token (instead of
+// generating a random one). This is used when auto-registering a runner that
+// skips the Register RPC (e.g., forgejo-runner one-job) — the registration
+// token is reused as the session token so subsequent RPCs with the same token
+// are recognized.
+func (m *Manager) CreateWithToken(taskCtx *store.TaskCtx, sessionToken string, runnerName string, labels []string) *Session {
 	session := &Session{
 		SessionToken: sessionToken,
 		TaskCtx:      taskCtx,
@@ -81,6 +88,17 @@ func (m *Manager) Lookup(sessionToken string) (*Session, bool) {
 	session, ok := m.sessions[sessionToken]
 	m.mu.RUnlock()
 	return session, ok
+}
+
+// Update updates the runner name and labels for an existing session.
+// It is a no-op if the session does not exist.
+func (m *Manager) Update(sessionToken string, runnerName string, labels []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s, ok := m.sessions[sessionToken]; ok {
+		s.RunnerName = runnerName
+		s.Labels = labels
+	}
 }
 
 // Remove deletes the session identified by sessionToken from the manager. It is

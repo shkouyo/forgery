@@ -139,31 +139,87 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 	}), nil
 }
 
-// Declare handles the Declare RPC. The internal runner announces its version
-// and labels before fetching a task. The session token from Register is
-// validated via the x-runner-token header or Authorization header.
-func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRequest]) (*connect.Response[v1.DeclareResponse], error) {
-	sessionToken, ok := sessionTokenFromRequest(req, h.log)
+// authenticate extracts the session token from the request and looks it up.
+// If the token is not a session token, it tries to treat it as a registration
+// token and auto-creates a session. This supports forgejo-runner v12+ one-job
+// which skips the Register RPC and sends the registration token directly as
+// x-runner-token in Declare/FetchTask/UpdateTask/UpdateLog.
+func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error) {
+	token, ok := sessionTokenFromRequest(req, h.log)
 	if !ok {
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
 	}
 
-	tokenPreview := sessionToken
+	tokenPreview := token
 	if len(tokenPreview) > 8 {
 		tokenPreview = tokenPreview[:8]
 	}
-	h.log.Debug("declare: looking up session",
-		"session_token_prefix", tokenPreview,
-		"session_token_len", len(sessionToken),
-	)
 
-	sess, ok := h.sessions.Lookup(sessionToken)
+	// Try session token first (normal path after explicit Register).
+	sess, ok := h.sessions.Lookup(token)
+	if ok {
+		return sess, nil
+	}
+
+	// Not a session token — try registration token (forgejo-runner one-job path).
+	taskCtx, ok := h.store.GetByRegToken(token)
 	if !ok {
-		h.log.Warn("declare: session not found",
-			"session_token_prefix", tokenPreview,
-			"session_token_len", len(sessionToken),
+		h.log.Warn("session not found and not a valid registration token",
+			"token_prefix", tokenPreview,
+			"token_len", len(token),
 		)
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	}
+
+	// Check token expiry.
+	if time.Since(taskCtx.CreatedAt) > h.cfg.RegTokenTTL {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token expired"))
+	}
+
+	// Atomically consume the registration token.
+	if err := h.store.MarkRegTokenConsumed(token); err != nil {
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token already consumed"))
+	}
+
+	// Create a session using the registration token as the session token.
+	// This allows subsequent RPCs (FetchTask, UpdateTask, UpdateLog) which
+	// send the same token to find the session.
+	sess = h.sessions.CreateWithToken(taskCtx, token, "", nil)
+
+	// Mark the runner as registered.
+	taskCtx.MarkRunnerRegistered()
+
+	h.log.Info("runner auto-registered (one-job mode)",
+		"task_id", taskCtx.ID,
+		"token_prefix", tokenPreview,
+	)
+
+	return sess, nil
+}
+
+// Declare handles the Declare RPC. The internal runner announces its version
+// and labels before fetching a task. The session token from Register (or the
+// registration token from auto-registration) is validated via the x-runner-token
+// header or Authorization header.
+func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRequest]) (*connect.Response[v1.DeclareResponse], error) {
+	sess, err := h.authenticate(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update session metadata from Declare request (runner name and labels
+	// are set here when Register was skipped, e.g. one-job mode).
+	labels := req.Msg.GetLabels()
+	if len(labels) > 0 {
+		h.sessions.Update(sess.SessionToken, sess.RunnerName, labels)
+		sess.Labels = labels
+	}
+	// Set a default runner name if none was provided (one-job mode).
+	runnerName := sess.RunnerName
+	if runnerName == "" {
+		runnerName = "one-job-runner"
+		h.sessions.Update(sess.SessionToken, runnerName, sess.Labels)
+		sess.RunnerName = runnerName
 	}
 
 	h.log.Info("runner declared",
@@ -189,14 +245,9 @@ func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRe
 // calls return an empty response (defensive — an ephemeral runner should not
 // poll again after receiving a task).
 func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTaskRequest]) (*connect.Response[v1.FetchTaskResponse], error) {
-	sessionToken, ok := sessionTokenFromRequest(req, h.log)
-	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
-	}
-
-	sess, ok := h.sessions.Lookup(sessionToken)
-	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	sess, err := h.authenticate(req)
+	if err != nil {
+		return nil, err
 	}
 
 	h.log.Info("task fetched",
@@ -214,14 +265,9 @@ func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTa
 // forwarded to the real Forgejo instance. If the task has reached a terminal
 // state, the session and store entry are cleaned up.
 func (h *Handler) UpdateTask(ctx context.Context, req *connect.Request[v1.UpdateTaskRequest]) (*connect.Response[v1.UpdateTaskResponse], error) {
-	sessionToken, ok := sessionTokenFromRequest(req, h.log)
-	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
-	}
-
-	sess, ok := h.sessions.Lookup(sessionToken)
-	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	sess, err := h.authenticate(req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify the task ID matches the session's task.
@@ -243,7 +289,7 @@ func (h *Handler) UpdateTask(ctx context.Context, req *connect.Request[v1.Update
 		taskCtx := sess.TaskCtx
 		taskCtx.SetStatus(store.StatusTerminal)
 		taskCtx.MarkDone()
-		h.sessions.Remove(sessionToken)
+		h.sessions.Remove(sess.SessionToken)
 		h.store.Remove(taskCtx.ID)
 
 		h.log.Info("task terminal, cleaned up",
@@ -258,14 +304,9 @@ func (h *Handler) UpdateTask(ctx context.Context, req *connect.Request[v1.Update
 // UpdateLog handles the UpdateLog RPC. The internal runner streams log rows,
 // which are transparently forwarded to the real Forgejo instance.
 func (h *Handler) UpdateLog(ctx context.Context, req *connect.Request[v1.UpdateLogRequest]) (*connect.Response[v1.UpdateLogResponse], error) {
-	sessionToken, ok := sessionTokenFromRequest(req, h.log)
-	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing session token"))
-	}
-
-	sess, ok := h.sessions.Lookup(sessionToken)
-	if !ok {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+	sess, err := h.authenticate(req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Verify the task ID matches the session's task.
