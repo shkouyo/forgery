@@ -178,13 +178,21 @@ func setRunnerToken[T any](req *connect.Request[T], token string) {
 	req.Header().Set("x-runner-token", token)
 }
 
+// setRunnerUUID sets the x-runner-uuid header on a connect request.
+func setRunnerUUID[T any](req *connect.Request[T], token string) {
+	req.Header().Set("x-runner-uuid", token)
+}
+
+// discardLog is a logger that discards all output, used in tests for
+// sessionTokenFromRequest which requires a logger parameter.
+var discardLog = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.Level(999)}))
 // ── Tests: sessionTokenFromRequest ──────────────────────────────────────────
 
 func TestSessionTokenFromRequest_Bearer(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	setBearer(req, "my-secret-token")
 
-	tok, ok := sessionTokenFromRequest(req)
+	tok, ok := sessionTokenFromRequest(req, discardLog)
 	if !ok {
 		t.Fatal("expected ok=true for valid bearer")
 	}
@@ -197,7 +205,7 @@ func TestSessionTokenFromRequest_RunnerToken(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	setRunnerToken(req, "runner-session-token")
 
-	tok, ok := sessionTokenFromRequest(req)
+	tok, ok := sessionTokenFromRequest(req, discardLog)
 	if !ok {
 		t.Fatal("expected ok=true for x-runner-token header")
 	}
@@ -212,7 +220,7 @@ func TestSessionTokenFromRequest_RunnerTokenPreferred(t *testing.T) {
 	setRunnerToken(req, "runner-token")
 	setBearer(req, "bearer-token")
 
-	tok, ok := sessionTokenFromRequest(req)
+	tok, ok := sessionTokenFromRequest(req, discardLog)
 	if !ok {
 		t.Fatal("expected ok=true when both headers are present")
 	}
@@ -224,7 +232,7 @@ func TestSessionTokenFromRequest_RunnerTokenPreferred(t *testing.T) {
 func TestSessionTokenFromRequest_NoHeader(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 
-	_, ok := sessionTokenFromRequest(req)
+	_, ok := sessionTokenFromRequest(req, discardLog)
 	if ok {
 		t.Fatal("expected ok=false when no headers")
 	}
@@ -234,7 +242,7 @@ func TestSessionTokenFromRequest_NotBearer(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	req.Header().Set("Authorization", "Basic YWxhZGRpbjpvcGVuc2VzYW1l")
 
-	_, ok := sessionTokenFromRequest(req)
+	_, ok := sessionTokenFromRequest(req, discardLog)
 	if ok {
 		t.Fatal("expected ok=false for non-Bearer scheme")
 	}
@@ -244,7 +252,7 @@ func TestSessionTokenFromRequest_EmptyBearer(t *testing.T) {
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	req.Header().Set("Authorization", "Bearer ")
 
-	tok, ok := sessionTokenFromRequest(req)
+	tok, ok := sessionTokenFromRequest(req, discardLog)
 	if !ok {
 		t.Fatal("expected ok=true for Bearer prefix")
 	}
@@ -259,12 +267,40 @@ func TestSessionTokenFromRequest_EmptyRunnerToken(t *testing.T) {
 	req.Header().Set("x-runner-token", "")
 	setBearer(req, "fallback-token")
 
-	tok, ok := sessionTokenFromRequest(req)
+	tok, ok := sessionTokenFromRequest(req, discardLog)
 	if !ok {
 		t.Fatal("expected ok=true when x-runner-token is empty but bearer is present")
 	}
 	if tok != "fallback-token" {
 		t.Fatalf("expected fallback bearer token, got %q", tok)
+	}
+}
+
+func TestSessionTokenFromRequest_RunnerUUID(t *testing.T) {
+	req := connect.NewRequest(&v1.DeclareRequest{})
+	setRunnerUUID(req, "runner-uuid-token")
+
+	tok, ok := sessionTokenFromRequest(req, discardLog)
+	if !ok {
+		t.Fatal("expected ok=true for x-runner-uuid header")
+	}
+	if tok != "runner-uuid-token" {
+		t.Fatalf("expected token 'runner-uuid-token', got %q", tok)
+	}
+}
+
+func TestSessionTokenFromRequest_RunnerTokenPreferredOverUUID(t *testing.T) {
+	// x-runner-token should be preferred over x-runner-uuid
+	req := connect.NewRequest(&v1.DeclareRequest{})
+	setRunnerToken(req, "runner-token")
+	setRunnerUUID(req, "runner-uuid-token")
+
+	tok, ok := sessionTokenFromRequest(req, discardLog)
+	if !ok {
+		t.Fatal("expected ok=true when both headers are present")
+	}
+	if tok != "runner-token" {
+		t.Fatalf("expected x-runner-token to take precedence over x-runner-uuid, got %q", tok)
 	}
 }
 
@@ -485,6 +521,36 @@ func TestDeclare_MissingToken(t *testing.T) {
 	}
 	if connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf("expected Unauthenticated, got %v", connect.CodeOf(err))
+	}
+}
+
+func TestDeclare_ValidSessionRunnerUUID(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	fw := newMockForwarder()
+	h := newTestHandler(ms, sm, fw)
+
+	regToken := "declare-uuid-test"
+	taskCtx := newTaskCtx(ms, 42, regToken)
+	taskCtx.CreatedAt = time.Now()
+
+	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner", Labels: []string{"linux"}})
+	regResp, err := h.Register(context.Background(), regReq)
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	sessionToken := regResp.Msg.GetRunner().GetToken()
+
+	// Declare using x-runner-uuid header (forgejo-runner v13+ style).
+	declReq := connect.NewRequest(&v1.DeclareRequest{Version: "1.0.0", Labels: []string{"linux"}})
+	setRunnerUUID(declReq, sessionToken)
+
+	resp, err := h.Declare(context.Background(), declReq)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Msg.GetRunner() == nil {
+		t.Fatal("expected runner in response")
 	}
 }
 
