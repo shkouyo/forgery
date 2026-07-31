@@ -16,7 +16,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -73,9 +72,6 @@ type Instance struct {
 	ForgejoRunnerToken  string `toml:"forgejo_runner_token"`  // forgejo_runner_token (required)
 	ForgejoRunnerName   string `toml:"forgejo_runner_name"`   // forgejo_runner_name (default: "forgery")
 	ForgejoRunnerLabels Labels `toml:"forgejo_runner_labels"` // forgejo_runner_labels (required, comma-sep)
-
-	// ── Container ──
-	DefaultContainerImage string `toml:"default_container_image"` // default_container_image (default: "")
 
 	// ── Concurrency & timeouts ──
 	PollInterval      time.Duration `toml:"poll_interval"`      // poll_interval (default: 3s)
@@ -187,7 +183,6 @@ func applyDefaults(cfg *Config, path string) {
 		if inst.ForgejoRunnerName == "" {
 			inst.ForgejoRunnerName = "forgery"
 		}
-		// DefaultContainerImage default is "" (zero value).
 		if inst.PollInterval == 0 {
 			inst.PollInterval = 3 * time.Second
 		}
@@ -317,26 +312,6 @@ func (e *errValidation) Error() string {
 		parts = append(parts, "invalid configuration values: "+strings.Join(e.invalid, ", "))
 	}
 	return strings.Join(parts, "; ")
-}
-
-// MissingFields extracts the list of missing required field names from an
-// error, if the error is a validation error.
-func MissingFields(err error) []string {
-	var ve *errValidation
-	if errors.As(err, &ve) {
-		return ve.missing
-	}
-	return nil
-}
-
-// InvalidFields extracts the list of invalid value descriptions from an
-// error, if the error is a validation error.
-func InvalidFields(err error) []string {
-	var ve *errValidation
-	if errors.As(err, &ve) {
-		return ve.invalid
-	}
-	return nil
 }
 
 // ── helpers ──

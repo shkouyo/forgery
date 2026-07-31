@@ -30,19 +30,17 @@ func testGitHub(apiURL string) GitHub {
 	}
 }
 
-// testInstances returns two instances with distinct labels and container
-// images, for routing verification.
+// testInstances returns two instances with distinct label sets, for
+// routing verification.
 func testInstances() []config.Instance {
 	return []config.Instance{
 		{
-			Name:                  "inst-a",
-			ForgejoRunnerLabels:   []string{"ubuntu-latest:docker://node:20", "docker:docker://ghcr.io/test"},
-			DefaultContainerImage: "docker://ghcr.io/catthehacker/ubuntu:act-latest",
+			Name:                "inst-a",
+			ForgejoRunnerLabels: []string{"ubuntu-latest:docker://node:20", "docker:docker://ghcr.io/test"},
 		},
 		{
-			Name:                  "inst-b",
-			ForgejoRunnerLabels:   []string{"linux:docker://debian:bookworm"},
-			DefaultContainerImage: "docker://ghcr.io/catthehacker/debian:bookworm",
+			Name:                "inst-b",
+			ForgejoRunnerLabels: []string{"linux:docker://debian:bookworm"},
 		},
 	}
 }
@@ -132,7 +130,7 @@ func TestTrigger_RequestBodyFormat(t *testing.T) {
 			t.Errorf("expected ref 'main', got: %q", body.Ref)
 		}
 
-		// Verify all 5 inputs.
+		// Verify all 3 inputs.
 		inputs := body.Inputs
 		if inputs.ProxyURL != "https://forgery.example.com:8443" {
 			t.Errorf("expected proxy_url %q, got: %q", "https://forgery.example.com:8443", inputs.ProxyURL)
@@ -143,12 +141,6 @@ func TestTrigger_RequestBodyFormat(t *testing.T) {
 		expectedLabels := "ubuntu-latest:docker://node:20,docker:docker://ghcr.io/test"
 		if inputs.Labels != expectedLabels {
 			t.Errorf("expected labels %q, got: %q", expectedLabels, inputs.Labels)
-		}
-		if inputs.ContainerImage != "docker://ghcr.io/catthehacker/ubuntu:act-latest" {
-			t.Errorf("expected container_image %q, got: %q", "docker://ghcr.io/catthehacker/ubuntu:act-latest", inputs.ContainerImage)
-		}
-		if inputs.TaskID != "42" {
-			t.Errorf("expected task_id %q, got: %q", "42", inputs.TaskID)
 		}
 
 		w.WriteHeader(http.StatusNoContent)
@@ -164,12 +156,11 @@ func TestTrigger_RequestBodyFormat(t *testing.T) {
 }
 
 // TestTrigger_PerInstanceInputs verifies the multi-instance routing contract:
-// each task's labels and container_image come from its own instance, while
-// the global GitHub fields stay fixed.
+// each task's labels come from its own instance, while the global GitHub
+// fields stay fixed.
 func TestTrigger_PerInstanceInputs(t *testing.T) {
 	var mu sync.Mutex
-	labelsByInstance := map[string]string{}
-	imagesByInstance := map[string]string{}
+	labelsSeen := []string{}
 	var globalFields []string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,8 +171,7 @@ func TestTrigger_PerInstanceInputs(t *testing.T) {
 			return
 		}
 		mu.Lock()
-		labelsByInstance[body.Inputs.TaskID] = body.Inputs.Labels
-		imagesByInstance[body.Inputs.TaskID] = body.Inputs.ContainerImage
+		labelsSeen = append(labelsSeen, body.Inputs.Labels)
 		globalFields = append(globalFields, body.Ref+"/"+body.Inputs.ProxyURL)
 		mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
@@ -204,17 +194,15 @@ func TestTrigger_PerInstanceInputs(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if got := labelsByInstance["1"]; got != "ubuntu-latest:docker://node:20,docker:docker://ghcr.io/test" {
-		t.Errorf("inst-a labels = %q, want its own label set", got)
+	if len(labelsSeen) != 2 {
+		t.Fatalf("got %d dispatches, want 2", len(labelsSeen))
 	}
-	if got := labelsByInstance["2"]; got != "linux:docker://debian:bookworm" {
-		t.Errorf("inst-b labels = %q, want its own label set", got)
+	// Triggers run sequentially, so request order matches task order.
+	if labelsSeen[0] != "ubuntu-latest:docker://node:20,docker:docker://ghcr.io/test" {
+		t.Errorf("inst-a labels = %q, want its own label set", labelsSeen[0])
 	}
-	if got := imagesByInstance["1"]; got != "docker://ghcr.io/catthehacker/ubuntu:act-latest" {
-		t.Errorf("inst-a container_image = %q, want its own image", got)
-	}
-	if got := imagesByInstance["2"]; got != "docker://ghcr.io/catthehacker/debian:bookworm" {
-		t.Errorf("inst-b container_image = %q, want its own image", got)
+	if labelsSeen[1] != "linux:docker://debian:bookworm" {
+		t.Errorf("inst-b labels = %q, want its own label set", labelsSeen[1])
 	}
 	// Global fields are identical for both dispatches.
 	if len(globalFields) != 2 || globalFields[0] != globalFields[1] {

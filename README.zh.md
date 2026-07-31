@@ -103,7 +103,6 @@ Forgery 通过单个 TOML 文件配置, 使用 `--config` 指定 (默认: 当前
 | `forgejo_runner_token` | Yes | -- | Forgejo runner 注册令牌 |
 | `forgejo_runner_name` | No | `forgery` | 在 Forgejo runner 列表中显示的显示名称 |
 | `forgejo_runner_labels` | Yes | -- | 逗号分隔的标签及可选容器镜像映射 (见 [标签](#标签)) |
-| `default_container_image` | No | -- | 无显式 `:docker://...` 映射的标签使用的默认容器镜像 |
 | `poll_interval` | No | `3s` | 北向 `FetchTask` 轮询间隔 |
 | `reg_token_ttl` | No | `15m` | 一次性注册令牌的有效期 |
 | `ga_startup_timeout` | No | `15m` | 等待 GA workflow 启动及内部 runner 注册的最长时间 |
@@ -127,12 +126,10 @@ label1:docker://image1,label2:docker://image2
 
 ```toml
 forgejo_runner_labels = "ubuntu-latest:docker://node:20-bookworm,docker:docker://ghcr.io/catthehacker/ubuntu:act-latest"
-default_container_image = "docker://ghcr.io/catthehacker/ubuntu:act-latest"
 ```
 
 - 当 Forgejo workflow 指定 `runs-on: ubuntu-latest` 时, Forgery 匹配该标签, runner 在 `node:20-bookworm` 中执行.
 - 当 `runs-on: docker` 时, 在 `ghcr.io/catthehacker/ubuntu:act-latest` 中执行.
-- 如果 `runs-on` 标签没有显式的 `:docker://...` 后缀, 则使用 `default_container_image`.
 
 相同的标签字符串同时用于北向注册 (让 Forgejo 知道路由哪些任务到 Forgery) 和内部 runner 配置 (让 GA workflow 知道使用哪个容器).
 
@@ -143,7 +140,7 @@ default_container_image = "docker://ghcr.io/catthehacker/ubuntu:act-latest"
 ## 工作原理
 
 1. **Forgejo 分发作业** -- 已注册为 runner 的 Forgery 通过 `FetchTask` 接收作业.
-2. **Forgery 触发 GitHub Actions Workflow** -- 调用 `workflow_dispatch` API, 传递任务元数据 (代理 URL, 一次性注册令牌, 标签, 容器镜像).
+2. **Forgery 触发 GitHub Actions Workflow** -- 调用 `workflow_dispatch` API, 传递任务元数据 (代理 URL, 一次性注册令牌, 标签).
 3. **GA Workflow 启动 forgejo-runner** -- 下载官方 runner 二进制文件, 以 `one-job` 临时模式启动, 连接回 Forgery 的 gRPC 端点.
 4. **Forgery 将任务交给内部 runner** -- runner 获取任务, 在容器内执行, 并报告结果.
 5. **日志和任务状态回流** -- `UpdateTask` 和 `UpdateLog` RPC 通过 Forgery 透明中继回 Forgejo.

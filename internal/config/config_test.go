@@ -30,7 +30,6 @@ forgejo_url = "https://forgejo.example.com"
 forgejo_runner_token = "test-runner-token"
 forgejo_runner_name = "test-runner"
 forgejo_runner_labels = "ubuntu-latest:docker://node:20,docker:docker://catthehacker/ubuntu:act-latest"
-default_container_image = "docker://ghcr.io/catthehacker/ubuntu:act-latest"
 poll_interval = "5s"
 reg_token_ttl = "10m"
 ga_startup_timeout = "20m"
@@ -133,11 +132,6 @@ func TestLoadAllFields(t *testing.T) {
 		t.Errorf("Instances[0].ForgejoRunnerLabels = %v, want %v", inst.ForgejoRunnerLabels, expectedLabels)
 	}
 
-	// Instance — container
-	if inst.DefaultContainerImage != "docker://ghcr.io/catthehacker/ubuntu:act-latest" {
-		t.Errorf("Instances[0].DefaultContainerImage = %q", inst.DefaultContainerImage)
-	}
-
 	// Instance — concurrency & timeouts
 	if inst.PollInterval != 5*time.Second {
 		t.Errorf("Instances[0].PollInterval = %v, want 5s", inst.PollInterval)
@@ -219,9 +213,6 @@ forgejo_runner_labels = "ubuntu-latest:docker://node:20"
 	}
 	if inst.ForgejoRunnerName != "forgery" {
 		t.Errorf("Instances[0].ForgejoRunnerName = %q, want forgery", inst.ForgejoRunnerName)
-	}
-	if inst.DefaultContainerImage != "" {
-		t.Errorf("Instances[0].DefaultContainerImage = %q, want empty", inst.DefaultContainerImage)
 	}
 	if inst.PollInterval != 3*time.Second {
 		t.Errorf("Instances[0].PollInterval = %v, want 3s", inst.PollInterval)
@@ -391,7 +382,7 @@ func TestRequiredFieldValidation(t *testing.T) {
 			t.Fatal("expected error for all missing fields")
 		}
 
-		missing := MissingFields(err)
+		missing := missingFields(err)
 		if len(missing) != len(requiredFields)+1 {
 			t.Errorf("got %d missing fields, want %d: %v", len(missing), len(requiredFields)+1, missing)
 		}
@@ -429,7 +420,7 @@ func TestRequiredFieldValidation(t *testing.T) {
 				if err == nil {
 					t.Fatalf("expected error for missing %s", field)
 				}
-				missing := MissingFields(err)
+				missing := missingFields(err)
 				if len(missing) != 1 {
 					t.Errorf("expected exactly 1 missing field, got %d: %v", len(missing), missing)
 				}
@@ -450,7 +441,7 @@ github_workflow_id = "forgery-runner.yml"
 		if err == nil {
 			t.Fatal("expected error when no [[instances]] is present")
 		}
-		missing := MissingFields(err)
+		missing := missingFields(err)
 		if !contains(missing, "instances") {
 			t.Errorf("missing fields = %v, want them to include instances", missing)
 		}
@@ -467,7 +458,7 @@ forgejo_url = "https://forgejo.example.com"
 		if err == nil {
 			t.Fatal("expected error for multiple missing fields")
 		}
-		missing := MissingFields(err)
+		missing := missingFields(err)
 		// github_repo, github_workflow_id, forgejo_runner_token,
 		// forgejo_runner_labels.
 		if len(missing) != 4 {
@@ -488,7 +479,7 @@ forgejo_runner_labels = "linux"
 	if err == nil {
 		t.Fatal("expected error for duplicate instance names")
 	}
-	invalid := InvalidFields(err)
+	invalid := invalidFields(err)
 	if len(invalid) != 1 {
 		t.Fatalf("got %d invalid fields, want 1: %v", len(invalid), invalid)
 	}
@@ -521,7 +512,7 @@ forgejo_runner_labels = "ubuntu-latest:docker://node:20"
 	if err == nil {
 		t.Fatal("expected error when defaulted instance names collide")
 	}
-	invalid := InvalidFields(err)
+	invalid := invalidFields(err)
 	found := false
 	for _, f := range invalid {
 		if strings.Contains(f, "duplicate instance name") {
@@ -544,7 +535,7 @@ forgejo_runner_labels = "ubuntu-latest:docker://node:20"
 	if err == nil {
 		t.Fatal("expected error when GitHub fields are missing")
 	}
-	missing := MissingFields(err)
+	missing := missingFields(err)
 	for _, f := range []string{"github_token", "github_repo", "github_workflow_id"} {
 		if !contains(missing, f) {
 			t.Errorf("missing field %q not in error: %v", f, missing)
@@ -607,6 +598,27 @@ forgejo_runner_lables = "ubuntu-latest:docker://node:20"
 	}
 }
 
+// TestRemovedDefaultContainerImageKey pins the breaking removal of the
+// default_container_image instance key: it was dropped end-to-end (config →
+// workflow_dispatch payload → workflow template) because nothing downstream
+// consumed it. A config that still sets it must fail loudly as an unknown
+// key instead of being silently ignored.
+func TestRemovedDefaultContainerImageKey(t *testing.T) {
+	doc := validConfig() + `
+default_container_image = "docker://ghcr.io/catthehacker/ubuntu:act-latest"
+`
+	_, err := Load(writeConfig(t, doc))
+	if err == nil {
+		t.Fatal("expected error for removed key default_container_image")
+	}
+	if !strings.Contains(err.Error(), "unknown keys") {
+		t.Errorf("error %q does not mention unknown keys", err)
+	}
+	if !strings.Contains(err.Error(), "default_container_image") {
+		t.Errorf("error %q does not mention removed key default_container_image", err)
+	}
+}
+
 func TestInvalidDurationError(t *testing.T) {
 	// Unparseable duration string → TOML decode error.
 	doc := `
@@ -631,7 +643,7 @@ poll_interval = "not-a-duration"
 	if err == nil {
 		t.Fatal("expected error for negative duration")
 	}
-	invalid := InvalidFields(err)
+	invalid := invalidFields(err)
 	if !contains(invalid, "instances[0].poll_interval (must be positive)") {
 		t.Errorf("invalid fields = %v, want poll_interval listed", invalid)
 	}
@@ -660,7 +672,7 @@ forgejo_runner_labels = "ubuntu-latest:docker://node:20"
 	if err == nil {
 		t.Fatal("expected error for negative max_parallel_tasks")
 	}
-	invalid := InvalidFields(err)
+	invalid := invalidFields(err)
 	if !contains(invalid, "max_parallel_tasks (must be positive)") {
 		t.Errorf("invalid fields = %v, want max_parallel_tasks listed", invalid)
 	}
@@ -691,7 +703,7 @@ func TestMissingFileError(t *testing.T) {
 	if !strings.Contains(err.Error(), "does-not-exist.toml") {
 		t.Errorf("error %q does not mention the file path", err)
 	}
-	if fields := MissingFields(err); fields != nil {
+	if fields := missingFields(err); fields != nil {
 		t.Errorf("MissingFields on read error should be nil, got %v", fields)
 	}
 }
@@ -848,14 +860,14 @@ func TestMustLoad(t *testing.T) {
 // That's tested implicitly via Load's error path.
 
 func TestMissingFieldsHelper(t *testing.T) {
-	// MissingFields returns nil for non-validation errors.
-	if fields := MissingFields(errors.New("some other error")); fields != nil {
-		t.Errorf("MissingFields on plain error should return nil, got %v", fields)
+	// missingFields returns nil for non-validation errors.
+	if fields := missingFields(errors.New("some other error")); fields != nil {
+		t.Errorf("missingFields on plain error should return nil, got %v", fields)
 	}
 
-	// InvalidFields returns nil for non-validation errors.
-	if fields := InvalidFields(errors.New("some other error")); fields != nil {
-		t.Errorf("InvalidFields on plain error should return nil, got %v", fields)
+	// invalidFields returns nil for non-validation errors.
+	if fields := invalidFields(errors.New("some other error")); fields != nil {
+		t.Errorf("invalidFields on plain error should return nil, got %v", fields)
 	}
 
 	// Both work on validation errors.
@@ -863,9 +875,9 @@ func TestMissingFieldsHelper(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	missing := MissingFields(err)
+	missing := missingFields(err)
 	if len(missing) == 0 {
-		t.Error("MissingFields on validation error should return fields")
+		t.Error("missingFields on validation error should return fields")
 	}
 	// All 7 required items: 3 global + instances + 3 instance fields.
 	if len(missing) != 7 {
@@ -908,6 +920,28 @@ func TestExampleFileParses(t *testing.T) {
 }
 
 // ── helpers ──
+
+// missingFields extracts the list of missing required field names from an
+// error, if the error is a validation error. Test-only counterpart of the
+// errValidation accessors that used to live in the production package.
+func missingFields(err error) []string {
+	var ve *errValidation
+	if errors.As(err, &ve) {
+		return ve.missing
+	}
+	return nil
+}
+
+// invalidFields extracts the list of invalid value descriptions from an
+// error, if the error is a validation error. Test-only counterpart of the
+// errValidation accessors that used to live in the production package.
+func invalidFields(err error) []string {
+	var ve *errValidation
+	if errors.As(err, &ve) {
+		return ve.invalid
+	}
+	return nil
+}
 
 func stringSlicesEqual(a, b []string) bool {
 	if len(a) != len(b) {

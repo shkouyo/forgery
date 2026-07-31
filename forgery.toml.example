@@ -37,9 +37,6 @@ forgejo_runner_token = "YOUR_RUNNER_TOKEN"    # forgejo_runner_token (required)
 forgejo_runner_name = "forgery"               # forgejo_runner_name (default: "forgery")
 forgejo_runner_labels = "ubuntu-latest:docker://node:20,docker:docker://catthehacker/ubuntu:act-latest" # forgejo_runner_labels (required, comma-separated)
 
-# ── Container ──
-default_container_image = ""  # default_container_image (default: "")
-
 # ── Concurrency & timeouts ──
 poll_interval = "3s"       # poll_interval (default: "3s")
 reg_token_ttl = "15m"      # reg_token_ttl (default: "15m")

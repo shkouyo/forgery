@@ -63,9 +63,8 @@ type Dispatcher struct {
 
 // NewDispatcher creates a Dispatcher with the httpClientTimeout HTTP client
 // timeout and the forgery/<version> User-Agent header. gh carries the global
-// GitHub
-// Actions settings; per-instance values (labels, container image) arrive at
-// Trigger time.
+// GitHub Actions settings; per-instance values (labels) arrive at Trigger
+// time.
 func NewDispatcher(gh GitHub, log *slog.Logger) *Dispatcher {
 	return &Dispatcher{
 		client: &http.Client{
@@ -95,20 +94,18 @@ type dispatchInputs struct {
 }
 
 type dispatchInput struct {
-	ProxyURL       string `json:"proxy_url"`
-	RegToken       string `json:"reg_token"`
-	Labels         string `json:"labels"`
-	ContainerImage string `json:"container_image"`
-	TaskID         string `json:"task_id"`
+	ProxyURL string `json:"proxy_url"`
+	RegToken string `json:"reg_token"`
+	Labels   string `json:"labels"`
 }
 
 // Trigger sends a workflow_dispatch request to the GitHub API to start
 // a forgejo-runner for the given task on the given Forgejo instance. It
 // retries on server errors (5xx) and network errors with exponential
 // backoff. Client errors (4xx) are not retried. Context cancellation is
-// respected. inst supplies the per-instance dispatch inputs (labels,
-// container image); all GitHub connection settings come from the global
-// GitHub struct captured at construction.
+// respected. inst supplies the per-instance dispatch inputs (labels);
+// all GitHub connection settings come from the global GitHub struct
+// captured at construction.
 func (d *Dispatcher) Trigger(ctx context.Context, taskCtx *store.TaskCtx, inst config.Instance) error {
 	return d.triggerWithRetry(ctx, taskCtx, inst, d.maxRetries)
 }
@@ -154,8 +151,8 @@ func (d *Dispatcher) triggerWithRetry(ctx context.Context, taskCtx *store.TaskCt
 }
 
 // dispatch sends a single workflow_dispatch request to the GitHub API.
-// Global connection settings come from d.gh; per-instance inputs (labels,
-// container image) come from inst.
+// Global connection settings come from d.gh; per-instance inputs (labels)
+// come from inst.
 func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx, inst config.Instance) error {
 	url := fmt.Sprintf("%s/repos/%s/actions/workflows/%s/dispatches",
 		d.gh.APIURL, d.gh.Repo, d.gh.WorkflowID)
@@ -163,11 +160,9 @@ func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx, inst 
 	body := dispatchInputs{
 		Ref: d.gh.Ref,
 		Inputs: dispatchInput{
-			ProxyURL:       d.gh.PublicURL,
-			RegToken:       taskCtx.RegToken,
-			Labels:         strings.Join(inst.ForgejoRunnerLabels, ","),
-			ContainerImage: inst.DefaultContainerImage,
-			TaskID:         fmt.Sprintf("%d", taskCtx.ID),
+			ProxyURL: d.gh.PublicURL,
+			RegToken: taskCtx.RegToken,
+			Labels:   strings.Join(inst.ForgejoRunnerLabels, ","),
 		},
 	}
 

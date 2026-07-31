@@ -12,12 +12,6 @@ on:
       labels:
         description: 'comma-separated runner labels (with :docker://...)'
         required: true
-      container_image:
-        description: 'default container image'
-        required: false
-      task_id:
-        description: 'Forgejo task id (for logging)'
-        required: false
 
 jobs:
   run:

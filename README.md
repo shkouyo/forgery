@@ -103,7 +103,6 @@ One `[[instances]]` entry per Forgejo connection (at least one is required):
 | `forgejo_runner_token` | Yes | — | Forgejo runner registration token |
 | `forgejo_runner_name` | No | `forgery` | Display name shown in Forgejo's runner list |
 | `forgejo_runner_labels` | Yes | — | Comma-separated labels with optional container image mappings (see [Labels](#labels)) |
-| `default_container_image` | No | — | Default container image for labels without an explicit `:docker://...` mapping |
 | `poll_interval` | No | `3s` | Interval between northbound `FetchTask` polls |
 | `reg_token_ttl` | No | `15m` | Lifetime of a one-time registration token |
 | `ga_startup_timeout` | No | `15m` | Maximum time to wait for a GA workflow to start and the internal runner to register |
@@ -127,12 +126,10 @@ Example:
 
 ```toml
 forgejo_runner_labels = "ubuntu-latest:docker://node:20-bookworm,docker:docker://ghcr.io/catthehacker/ubuntu:act-latest"
-default_container_image = "docker://ghcr.io/catthehacker/ubuntu:act-latest"
 ```
 
 - When a Forgejo workflow specifies `runs-on: ubuntu-latest`, Forgery matches it and the runner executes in `node:20-bookworm`.
 - When `runs-on: docker`, it executes in `ghcr.io/catthehacker/ubuntu:act-latest`.
-- If a `runs-on` label has no explicit `:docker://...` suffix, `default_container_image` is used.
 
 The same label string is used for both northbound registration (so Forgejo knows which tasks to route to Forgery) and the internal runner configuration (so the GA workflow knows which container to use).
 
@@ -143,7 +140,7 @@ When `health_addr` is set, Forgery runs a health probe HTTP server on that addre
 ## How It Works
 
 1. **Forgejo dispatches a job** — Forgery, registered as a runner, receives it via `FetchTask`.
-2. **Forgery triggers a GitHub Actions workflow** — it calls the `workflow_dispatch` API, passing task metadata (proxy URL, one-time registration token, labels, container image).
+2. **Forgery triggers a GitHub Actions workflow** — it calls the `workflow_dispatch` API, passing task metadata (proxy URL, one-time registration token, labels).
 3. **The GA workflow starts a real `forgejo-runner`** — it downloads the official runner binary and launches it in `one-job` ephemeral mode, connecting back to Forgery's gRPC endpoint.
 4. **Forgery hands the Forgejo task to the internal runner** — the runner fetches the task, executes it inside a container, and reports results.
 5. **Logs and task status flow back** — `UpdateTask` and `UpdateLog` RPCs are transparently relayed through Forgery to Forgejo.
