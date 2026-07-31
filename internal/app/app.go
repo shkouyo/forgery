@@ -203,9 +203,10 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Periodic GC: reaps expired Pending/old Terminal tasks from the store
-	// and expires orphaned runner sessions (see gcLoop and sessionMaxAge).
-	// It exits on ctx cancellation and does not block graceful shutdown.
+	// Periodic GC: reaps Pending tasks past their per-task
+	// registration-token TTL and expires orphaned runner sessions (see
+	// gcLoop and sessionMaxAge). It exits on ctx cancellation and does
+	// not block graceful shutdown.
 	go gcLoop(ctx, gcInterval, taskStore, sessionMgr, resolver, sessionMaxAge(cfg), log)
 
 	// One poller per instance, all acquiring from the same shared pool and
@@ -352,9 +353,9 @@ func sessionMaxAge(cfg *config.Config) time.Duration {
 	return 2 * maxGAStartupTimeout(cfg)
 }
 
-// gcOnce performs one garbage-collection pass: (a) store.GC reaps expired
-// Pending tasks and Terminal tasks past their retention; (b) Expire drops
-// sessions whose last activity is older than maxAge — i.e. runners that
+// gcOnce performs one garbage-collection pass: (a) store.GC reaps Pending
+// tasks whose registration token has outlived its per-task TTL; (b) Expire
+// drops sessions whose last activity is older than maxAge — i.e. runners that
 // registered but went silent — and for each of them best-effort reports a
 // failure to the owning Forgejo instance, then forces the task terminal
 // (MarkDone releases the backpressure slot if HandleTask is still waiting

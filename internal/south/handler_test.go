@@ -183,24 +183,25 @@ type instanceEntry struct {
 	client north.Client
 }
 
-// mkEntry builds a resolver map value with the given TTL.
-func mkEntry(name string, ttl time.Duration, client north.Client) instanceEntry {
+// mkEntry builds a resolver map value.
+func mkEntry(name string, client north.Client) instanceEntry {
 	return instanceEntry{
-		inst:   config.Instance{Name: name, RegTokenTTL: ttl},
+		inst:   config.Instance{Name: name},
 		client: client,
 	}
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-// testResolver returns a resolver with two instances: inst-a (15m TTL) and
-// inst-b (1m TTL), each with its own recording client.
+// testResolver returns a resolver with two instances, each with its own
+// recording client. Registration-token TTLs are not part of the resolver
+// anymore — they travel on the task (see newTaskCtx).
 func testResolver() (*fakeResolver, *mockClient, *mockClient) {
 	clientA := newMockClient()
 	clientB := newMockClient()
 	resolver := newFakeResolver(map[string]instanceEntry{
-		"inst-a": mkEntry("inst-a", 15*time.Minute, clientA),
-		"inst-b": mkEntry("inst-b", 1*time.Minute, clientB),
+		"inst-a": mkEntry("inst-a", clientA),
+		"inst-b": mkEntry("inst-b", clientB),
 	})
 	return resolver, clientA, clientB
 }
@@ -211,15 +212,17 @@ func newTestHandler(ms *mockStore, sm *session.Manager, resolver north.Resolver)
 }
 
 // newTaskCtx creates a fresh TaskCtx with a real Forgejo Task payload, a
-// registration token, an ID, and an owning instance. The task is put into
-// the mock store.
+// registration token, an ID, and an owning instance. RegTokenTTL defaults to
+// 15 minutes (the config default); tests probing token expiry override it.
+// The task is put into the mock store.
 func newTaskCtx(ms *mockStore, id int64, regToken string, instance string) *store.TaskCtx {
 	taskCtx := &store.TaskCtx{
-		ID:        id,
-		Instance:  instance,
-		Task:      &v1.Task{Id: id},
-		RegToken:  regToken,
-		CreatedAt: time.Now(),
+		ID:          id,
+		Instance:    instance,
+		Task:        &v1.Task{Id: id},
+		RegToken:    regToken,
+		RegTokenTTL: 15 * time.Minute,
+		CreatedAt:   time.Now(),
 	}
 	taskCtx.SetStatus(store.StatusPending)
 	ms.PutPending(taskCtx)
@@ -494,34 +497,37 @@ func TestRegister_ExpiredToken(t *testing.T) {
 	}
 }
 
-// TestRegister_TTLByInstance verifies the per-instance TTL contract: the
-// same token age can be expired on one instance and still valid on another,
-// depending on each instance's reg_token_ttl.
-func TestRegister_TTLByInstance(t *testing.T) {
+// TestRegister_TTLByTask verifies the per-task TTL contract: the same token
+// age can be expired on one task and still valid on another, depending on
+// each task's RegTokenTTL (stamped from the owning instance's reg_token_ttl
+// at creation). The TTL travels on the task, not on the instance resolver.
+func TestRegister_TTLByTask(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
 	resolver, _, _ := testResolver()
 	h := newTestHandler(ms, sm, resolver)
 
-	age := 2 * time.Minute // older than inst-b's 1m TTL, younger than inst-a's 15m TTL
+	age := 2 * time.Minute
 
-	// inst-a (15m TTL): still valid.
+	// Task with a long TTL (15m): still valid at 2 minutes old.
 	taskA := newTaskCtx(ms, 1, "token-a", "inst-a")
 	taskA.CreatedAt = time.Now().Add(-age)
+	taskA.RegTokenTTL = 15 * time.Minute
 	reqA := connect.NewRequest(&v1.RegisterRequest{Token: "token-a", Name: "runner-a"})
 	if _, err := h.Register(context.Background(), reqA); err != nil {
-		t.Errorf("inst-a register with %s-old token failed: %v (want success)", age, err)
+		t.Errorf("register with %s-old token under 15m task TTL failed: %v (want success)", age, err)
 	}
 
-	// inst-b (1m TTL): expired at the same age.
+	// Task with a short TTL (1m): expired at the same age.
 	taskB := newTaskCtx(ms, 2, "token-b", "inst-b")
 	taskB.CreatedAt = time.Now().Add(-age)
+	taskB.RegTokenTTL = 1 * time.Minute
 	reqB := connect.NewRequest(&v1.RegisterRequest{Token: "token-b", Name: "runner-b"})
 	_, err := h.Register(context.Background(), reqB)
 	if err == nil {
-		t.Error("inst-b register with token older than its TTL succeeded, want Unauthenticated")
+		t.Error("register with token older than the task TTL succeeded, want Unauthenticated")
 	} else if connect.CodeOf(err) != connect.CodeUnauthenticated {
-		t.Errorf("inst-b register error = %v, want Unauthenticated", connect.CodeOf(err))
+		t.Errorf("register error = %v, want Unauthenticated", connect.CodeOf(err))
 	}
 }
 
@@ -549,27 +555,6 @@ func TestRegister_AlreadyConsumed(t *testing.T) {
 	}
 	if connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf("expected Unauthenticated, got %v", connect.CodeOf(err))
-	}
-}
-
-// TestRegister_UnknownInstance verifies the defensive routing path: a token
-// that maps to an unknown instance is rejected with CodeInternal.
-func TestRegister_UnknownInstance(t *testing.T) {
-	ms := newMockStore()
-	sm := session.NewManager()
-	resolver, _, _ := testResolver()
-	h := newTestHandler(ms, sm, resolver)
-
-	regToken := "ghost-token"
-	newTaskCtx(ms, 42, regToken, "ghost-instance")
-
-	req := connect.NewRequest(&v1.RegisterRequest{Token: regToken})
-	_, err := h.Register(context.Background(), req)
-	if err == nil {
-		t.Fatal("expected error for unknown instance")
-	}
-	if connect.CodeOf(err) != connect.CodeInternal {
-		t.Fatalf("expected Internal, got %v", connect.CodeOf(err))
 	}
 }
 
@@ -1267,29 +1252,6 @@ func TestUpdateLog_UnknownInstance(t *testing.T) {
 	clientA.mu.Unlock()
 	if calledA != 0 {
 		t.Fatal("no log forward should happen for unknown instance")
-	}
-}
-
-// TestAuthenticate_OneJobUnknownInstance verifies the defensive path in the
-// one-job auto-registration flow: a registration token whose task belongs to
-// an unknown instance fails with CodeInternal.
-func TestAuthenticate_OneJobUnknownInstance(t *testing.T) {
-	ms := newMockStore()
-	sm := session.NewManager()
-	resolver, _, _ := testResolver()
-	h := newTestHandler(ms, sm, resolver)
-
-	newTaskCtx(ms, 5, "ghost-token", "ghost-instance")
-
-	req := connect.NewRequest(&v1.FetchTaskRequest{})
-	setRunnerToken(req, "ghost-token")
-
-	_, err := h.FetchTask(context.Background(), req)
-	if err == nil {
-		t.Fatal("expected error for unknown instance")
-	}
-	if connect.CodeOf(err) != connect.CodeInternal {
-		t.Fatalf("expected Internal, got %v", connect.CodeOf(err))
 	}
 }
 

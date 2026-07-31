@@ -63,7 +63,10 @@ func (c *client) PollLoop(ctx context.Context, pool *slots.Pool, taskCh chan<- *
 			continue
 		}
 
-		// Got a task — wrap it in a TaskCtx.
+		// Got a task — wrap it in a TaskCtx. RegTokenTTL is stamped once,
+		// at creation, from the owning instance's reg_token_ttl: the task
+		// is the single source of truth shared by south's token-expiry
+		// check and the store's Pending GC.
 		regToken, tokenErr := token.Generate()
 		if tokenErr != nil {
 			pool.Release() // release on token error
@@ -75,11 +78,12 @@ func (c *client) PollLoop(ctx context.Context, pool *slots.Pool, taskCh chan<- *
 		}
 
 		taskCtx := &store.TaskCtx{
-			ID:        resp.Msg.Task.Id,
-			Instance:  c.inst.Name,
-			Task:      resp.Msg.Task,
-			RegToken:  regToken,
-			CreatedAt: time.Now(),
+			ID:          resp.Msg.Task.Id,
+			Instance:    c.inst.Name,
+			Task:        resp.Msg.Task,
+			RegToken:    regToken,
+			RegTokenTTL: c.inst.RegTokenTTL,
+			CreatedAt:   time.Now(),
 		}
 		taskCtx.SetStatus(store.StatusPending)
 

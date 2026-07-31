@@ -5,35 +5,6 @@ import (
 	"time"
 )
 
-// Default time constants used by GC and MemStore defaults.
-const (
-	// DefaultPendingTTL is how long a task may remain in StatusPending before GC
-	// considers it expired. Aligns with the default REG_TOKEN_TTL of 15 min.
-	DefaultPendingTTL = 15 * time.Minute
-
-	// DefaultTerminalRetention is how long completed (StatusTerminal) tasks are
-	// kept before GC removes them.
-	DefaultTerminalRetention = 24 * time.Hour
-)
-
-// MemStoreOption is a functional option for configuring MemStore behavior.
-type MemStoreOption func(*MemStore)
-
-// WithPendingTTL sets the TTL for pending tasks before GC considers them expired.
-func WithPendingTTL(d time.Duration) MemStoreOption {
-	return func(m *MemStore) {
-		m.pendingTTL = d
-	}
-}
-
-// WithTerminalRetention sets how long completed tasks are retained before GC
-// removes them.
-func WithTerminalRetention(d time.Duration) MemStoreOption {
-	return func(m *MemStore) {
-		m.terminalRetention = d
-	}
-}
-
 // MemStore is the default in-memory implementation of TaskStore. It stores
 // tasks in a map keyed by the real Forgejo task id and maintains a secondary
 // index from registration token to task id for O(1) token lookups.
@@ -43,27 +14,19 @@ func WithTerminalRetention(d time.Duration) MemStoreOption {
 //	MemStore.mu  (outer — acquired first)
 //	TaskCtx.mu   (inner — acquired second, never while holding MemStore.mu)
 type MemStore struct {
-	mu                sync.RWMutex
-	tasks             map[int64]*TaskCtx // key = real Forgejo task_id
-	byReg             map[string]int64   // regToken → task_id index
-	pendingTTL        time.Duration
-	terminalRetention time.Duration
+	mu    sync.RWMutex
+	tasks map[int64]*TaskCtx // key = real Forgejo task_id
+	byReg map[string]int64   // regToken → task_id index
 }
 
-// NewMemStore returns an initialized, empty MemStore ready for use.
-// Default TTLs are DefaultPendingTTL (15 min) and DefaultTerminalRetention (24 h).
-// Use WithPendingTTL and WithTerminalRetention to customize.
-func NewMemStore(opts ...MemStoreOption) *MemStore {
-	m := &MemStore{
-		tasks:             make(map[int64]*TaskCtx),
-		byReg:             make(map[string]int64),
-		pendingTTL:        DefaultPendingTTL,
-		terminalRetention: DefaultTerminalRetention,
+// NewMemStore returns an initialized, empty MemStore ready for use. Expiry
+// policies live on the tasks themselves (TaskCtx.RegTokenTTL), so the store
+// carries no configuration.
+func NewMemStore() *MemStore {
+	return &MemStore{
+		tasks: make(map[int64]*TaskCtx),
+		byReg: make(map[string]int64),
 	}
-	for _, o := range opts {
-		o(m)
-	}
-	return m
 }
 
 // PutPending stores a task and indexes it by its registration token.
@@ -130,8 +93,17 @@ func (m *MemStore) removeLocked(taskID int64) {
 	}
 }
 
-// GC removes expired Pending tasks (older than the configured pendingTTL) and
-// Terminal tasks that are older than the configured terminalRetention.
+// GC removes Pending tasks whose registration token has outlived its TTL.
+// The deadline is per task — now.Sub(t.CreatedAt) > t.RegTokenTTL — so tasks
+// of instances with different reg_token_ttl settings expire independently,
+// and the Pending branch stays the single reclaimer for tasks stuck in
+// Pending (e.g. a shutdown race that interrupted dispatch before
+// MarkDispatched ran: nothing else ever touches them again).
+//
+// Terminal tasks are deliberately not retained: every terminal path (south's
+// terminal UpdateTask, run's failure/timeout branches, gcOnce's session
+// expiry) removes them eagerly, so GC would never have anything to reap.
+//
 // It respects the lock hierarchy by collecting candidates under the store lock,
 // inspecting task status outside the lock, and re-acquiring for deletion.
 func (m *MemStore) GC(now time.Time) {
@@ -149,11 +121,7 @@ func (m *MemStore) GC(now time.Time) {
 	// own lock). Accumulate ids to remove.
 	var toRemove []int64
 	for i, t := range taskPtrs {
-		st := t.Status()
-		switch {
-		case st == StatusPending && now.Sub(t.CreatedAt) > m.pendingTTL:
-			toRemove = append(toRemove, taskIDs[i])
-		case st == StatusTerminal && now.Sub(t.CreatedAt) > m.terminalRetention:
+		if t.Status() == StatusPending && now.Sub(t.CreatedAt) > t.RegTokenTTL {
 			toRemove = append(toRemove, taskIDs[i])
 		}
 	}

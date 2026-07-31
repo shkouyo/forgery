@@ -4,10 +4,11 @@
 // runners via one-time registration tokens and session bearer tokens.
 //
 // Routing: every registration token belongs to a task owned by exactly one
-// Forgejo instance. south depends only on the north.Resolver interface to
-// map the task's instance name to its configuration (reg_token TTL) and
-// northbound client (UpdateTask/UpdateLog forwarding); it never imports the
-// concrete north client type nor internal/app.
+// Forgejo instance. Registration-token expiry is judged purely from the task
+// itself (TaskCtx.RegTokenTTL, stamped by the poller at creation), so south
+// depends on the north.Resolver interface only to map the task's instance
+// name to its northbound client (UpdateTask/UpdateLog forwarding); it never
+// imports the concrete north client type nor internal/app.
 package south
 
 import (
@@ -107,14 +108,10 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid registration token"))
 	}
 
-	// Resolve the owning instance for the TTL check.
-	inst, _, ok := h.resolveInstance(taskCtx)
-	if !ok {
-		return nil, connect.NewError(connect.CodeInternal,
-			fmt.Errorf("registration token maps to unknown instance %q", taskCtx.Instance))
-	}
-
-	if h.isRegTokenExpired(taskCtx, inst.RegTokenTTL) {
+	// The token's deadline is per task: the poller stamped
+	// taskCtx.RegTokenTTL at creation, so no instance lookup is needed
+	// here — the task is the single source of truth.
+	if isRegTokenExpired(taskCtx) {
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token expired"))
 	}
 
@@ -198,14 +195,7 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
 	}
 
-	// Resolve the owning instance for the TTL check.
-	inst, _, ok := h.resolveInstance(taskCtx)
-	if !ok {
-		return nil, connect.NewError(connect.CodeInternal,
-			fmt.Errorf("registration token maps to unknown instance %q", taskCtx.Instance))
-	}
-
-	if h.isRegTokenExpired(taskCtx, inst.RegTokenTTL) {
+	if isRegTokenExpired(taskCtx) {
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token expired"))
 	}
 
@@ -390,10 +380,13 @@ func truncateToken(s string) string {
 	return s
 }
 
-// isRegTokenExpired checks whether the registration token has exceeded the
-// owning instance's TTL.
-func (h *Handler) isRegTokenExpired(tc *store.TaskCtx, ttl time.Duration) bool {
-	return time.Since(tc.CreatedAt) > ttl
+// isRegTokenExpired checks whether the task's registration token has
+// outlived its TTL. The TTL is read from the task itself — the poller
+// stamped RegTokenTTL once at creation from the owning instance's
+// reg_token_ttl — making the task the single source of truth shared with
+// the store's Pending GC, so the two can never disagree.
+func isRegTokenExpired(tc *store.TaskCtx) bool {
+	return time.Since(tc.CreatedAt) > tc.RegTokenTTL
 }
 
 // NewServer creates an HTTP server that serves the Connect RunnerServiceHandler

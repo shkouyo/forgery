@@ -11,13 +11,16 @@ import (
 )
 
 // newTestTask creates a TaskCtx with minimal required fields for testing.
+// RegTokenTTL defaults to 15 minutes (the config default); tests that probe
+// GC boundaries override RegTokenTTL or CreatedAt.
 func newTestTask(id int64, regToken string) *TaskCtx {
 	return &TaskCtx{
-		ID:        id,
-		Task:      &v1.Task{Id: id},
-		RegToken:  regToken,
-		CreatedAt: time.Now(),
-		status:    StatusPending,
+		ID:          id,
+		Task:        &v1.Task{Id: id},
+		RegToken:    regToken,
+		RegTokenTTL: 15 * time.Minute,
+		CreatedAt:   time.Now(),
+		status:      StatusPending,
 	}
 }
 
@@ -188,12 +191,14 @@ func TestCountActive_Empty(t *testing.T) {
 
 // ---- T-STO-005.6: GC cleans up expired Pending tasks ----
 
+// TestGC_ExpiredPending verifies GC reaps a Pending task whose age exceeds
+// its own RegTokenTTL (15m via the test helper) and keeps a fresh one.
 func TestGC_ExpiredPending(t *testing.T) {
 	s := NewMemStore()
 
-	// Create a task in the past (expired).
+	// Create a task in the past (expired: 20m old vs 15m task TTL).
 	old := newTestTask(1, "old-tok")
-	old.CreatedAt = time.Now().Add(-20 * time.Minute) // older than 15 min
+	old.CreatedAt = time.Now().Add(-20 * time.Minute)
 	s.PutPending(old)
 
 	// Create a fresh task.
@@ -223,7 +228,7 @@ func TestGC_ExpiredPending(t *testing.T) {
 func TestGC_PendingNotExpired(t *testing.T) {
 	s := NewMemStore()
 
-	// Task that is pending but only 10 minutes old.
+	// Task that is pending but only 10 minutes old (15m task TTL).
 	tc := newTestTask(1, "tok")
 	tc.CreatedAt = time.Now().Add(-10 * time.Minute)
 	s.PutPending(tc)
@@ -231,13 +236,17 @@ func TestGC_PendingNotExpired(t *testing.T) {
 	s.GC(time.Now())
 
 	if _, ok := s.GetByID(1); !ok {
-		t.Fatal("pending task within TTL should survive GC")
+		t.Fatal("pending task within its RegTokenTTL should survive GC")
 	}
 }
 
-// ---- T-STO-005.7: GC cleans up old Terminal tasks (>24h) ----
+// ---- T-STO-005.7: GC never touches Terminal tasks ----
 
-func TestGC_OldTerminal(t *testing.T) {
+// TestGC_TerminalTasksSurvive pins the post-unification contract: GC has no
+// terminal-retention branch because every terminal path (south's terminal
+// UpdateTask, run's failure/timeout branches, gcOnce's session expiry)
+// removes tasks eagerly. An arbitrarily old terminal task must survive GC.
+func TestGC_TerminalTasksSurvive(t *testing.T) {
 	s := NewMemStore()
 
 	old := newTestTask(1, "old-term")
@@ -245,18 +254,10 @@ func TestGC_OldTerminal(t *testing.T) {
 	old.status = StatusTerminal
 	s.PutPending(old)
 
-	recent := newTestTask(2, "recent-term")
-	recent.CreatedAt = time.Now().Add(-1 * time.Hour)
-	recent.status = StatusTerminal
-	s.PutPending(recent)
-
 	s.GC(time.Now())
 
-	if _, ok := s.GetByID(1); ok {
-		t.Fatal("terminal task older than 24h should be removed by GC")
-	}
-	if _, ok := s.GetByID(2); !ok {
-		t.Fatal("recent terminal task should survive GC")
+	if _, ok := s.GetByID(1); !ok {
+		t.Fatal("terminal task must survive GC (removal is the terminal path's job)")
 	}
 }
 
@@ -494,16 +495,10 @@ func TestTaskCtxMarkMethods(t *testing.T) {
 	if tc.Status() != StatusDispatched {
 		t.Fatal("MarkDispatched should set StatusDispatched")
 	}
-	if tc.DispatchedAt.IsZero() {
-		t.Fatal("MarkDispatched should set DispatchedAt")
-	}
 
 	tc.MarkRunnerRegistered()
 	if tc.Status() != StatusRunning {
 		t.Fatal("MarkRunnerRegistered should set StatusRunning")
-	}
-	if tc.RunnerRegisteredAt.IsZero() {
-		t.Fatal("MarkRunnerRegistered should set RunnerRegisteredAt")
 	}
 
 	tc.SetSessionToken("sess-123")
@@ -624,66 +619,52 @@ func TestRegistered_Concurrent(t *testing.T) {
 	<-tc.Registered()
 }
 
-// ---- T-STO-004: Custom TTL configuration ----
+// ---- T-STO-004: per-task RegTokenTTL drives the Pending GC boundary ----
 
-func TestNewMemStore_DefaultTTLs(t *testing.T) {
+// TestGC_PendingTTLByTask verifies the GC deadline is per task: two tasks of
+// the same age expire independently according to their own RegTokenTTL. This
+// is the store half of the TTL unification — the poller stamps each task
+// with its instance's reg_token_ttl and south's token-expiry check reads the
+// same field, so store and south can never disagree.
+func TestGC_PendingTTLByTask(t *testing.T) {
 	s := NewMemStore()
-	// Verify defaults are applied (indirectly through GC behavior).
-	old := newTestTask(1, "old")
-	old.CreatedAt = time.Now().Add(-20 * time.Minute) // older than default 15 min
-	s.PutPending(old)
 
-	s.GC(time.Now())
+	// Same age, different per-task TTLs.
+	short := newTestTask(1, "short-ttl")
+	short.CreatedAt = time.Now().Add(-10 * time.Minute)
+	short.RegTokenTTL = 5 * time.Minute // expired
+	s.PutPending(short)
 
-	// Should be removed (expired under default 15 min TTL).
-	if _, ok := s.GetByID(1); ok {
-		t.Fatal("expired pending task should be removed under default TTL")
-	}
-}
-
-func TestNewMemStore_WithPendingTTL(t *testing.T) {
-	s := NewMemStore(WithPendingTTL(5 * time.Minute))
-
-	// Task that's 10 min old — should be expired under 5 min TTL.
-	old := newTestTask(1, "old")
-	old.CreatedAt = time.Now().Add(-10 * time.Minute)
-	s.PutPending(old)
+	long := newTestTask(2, "long-ttl")
+	long.CreatedAt = time.Now().Add(-10 * time.Minute)
+	long.RegTokenTTL = 30 * time.Minute // still valid
+	s.PutPending(long)
 
 	s.GC(time.Now())
 
 	if _, ok := s.GetByID(1); ok {
-		t.Fatal("10-min-old pending task should be removed under 5 min TTL")
+		t.Fatal("pending task past its RegTokenTTL should be removed by GC")
+	}
+	if _, ok := s.GetByID(2); !ok {
+		t.Fatal("pending task within its RegTokenTTL should survive GC")
 	}
 }
 
-func TestNewMemStore_WithPendingTTL_NotExpired(t *testing.T) {
-	s := NewMemStore(WithPendingTTL(5 * time.Minute))
+// TestGC_PendingWithinTTL_Survives verifies a Pending task younger than its
+// RegTokenTTL is kept.
+func TestGC_PendingWithinTTL_Survives(t *testing.T) {
+	s := NewMemStore()
 
-	// Task that's only 2 min old — should survive 5 min TTL.
+	// Task that is pending and only 2 minutes old against a 5m TTL.
 	fresh := newTestTask(1, "fresh")
 	fresh.CreatedAt = time.Now().Add(-2 * time.Minute)
+	fresh.RegTokenTTL = 5 * time.Minute
 	s.PutPending(fresh)
 
 	s.GC(time.Now())
 
 	if _, ok := s.GetByID(1); !ok {
-		t.Fatal("2-min-old pending task should survive under 5 min TTL")
-	}
-}
-
-func TestNewMemStore_WithTerminalRetention(t *testing.T) {
-	s := NewMemStore(WithTerminalRetention(1 * time.Hour))
-
-	// Terminal task that's 2 hours old — should be removed under 1h retention.
-	old := newTestTask(1, "old")
-	old.CreatedAt = time.Now().Add(-2 * time.Hour)
-	old.status = StatusTerminal
-	s.PutPending(old)
-
-	s.GC(time.Now())
-
-	if _, ok := s.GetByID(1); ok {
-		t.Fatal("2h-old terminal task should be removed under 1h retention")
+		t.Fatal("pending task within its RegTokenTTL should survive GC")
 	}
 }
 

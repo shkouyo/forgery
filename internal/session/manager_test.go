@@ -10,8 +10,8 @@ import (
 )
 
 // newTaskCtx creates a minimal TaskCtx suitable for session tests.
-// The session module only accesses ID, RegToken, CreatedAt, and
-// calls SetSessionToken / SessionToken.
+// The session module only accesses ID and RegToken, and calls
+// SetSessionToken / SessionToken.
 func newTaskCtx(id int64, regToken string) *store.TaskCtx {
 	return &store.TaskCtx{
 		ID:        id,
@@ -512,21 +512,22 @@ func TestTouch_Concurrent(t *testing.T) {
 }
 
 // TestExpire_UsesLastActivityNotCreatedAt pins the expiry semantics: a
-// session created long ago but with recent activity survives, while a
-// freshly created session that has been silent expires. This is the property
-// that keeps long-running tasks alive in production.
+// session's deadline is anchored solely by LastActivity — the session itself
+// carries no creation timestamp, and in production a long-running task's
+// session is continuously renewed via Touch. A session with recent activity
+// survives; a freshly created session that has been silent expires. This is
+// the property that keeps long-running tasks alive in production.
 func TestExpire_UsesLastActivityNotCreatedAt(t *testing.T) {
 	m := NewManager()
 	const maxAge = time.Hour
 
-	// Old CreatedAt, recent activity: must survive (a long-running task
-	// whose runner keeps talking to the proxy).
+	// Recent activity: must survive (a long-running task whose runner
+	// keeps talking to the proxy — every RPC refreshes LastActivity).
 	longRunning := m.Create(newTaskCtx(1, "reg-1"), "runner-a", nil)
-	longRunning.CreatedAt = time.Now().Add(-3 * time.Hour)
 	longRunning.LastActivity = time.Now().Add(-time.Minute)
 
-	// Fresh CreatedAt, silent for longer than maxAge: must expire (a
-	// runner that registered and then died).
+	// Silent for longer than maxAge: must expire (a runner that
+	// registered and then died).
 	orphan := m.Create(newTaskCtx(2, "reg-2"), "runner-b", nil)
 	orphan.LastActivity = time.Now().Add(-2 * time.Hour)
 

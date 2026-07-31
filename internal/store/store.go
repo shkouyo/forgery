@@ -39,20 +39,19 @@ var ErrTokenNotFound = errors.New("store: registration token not found")
 // change. Mutable fields are protected by the embedded read-write mutex.
 type TaskCtx struct {
 	// Immutable fields — set once at creation, never modified.
-	ID        int64
-	Instance  string   // Name of the owning Forgejo instance (routing key)
-	Task      *v1.Task // Complete Forgejo Task (contains secrets, vars, needs)
-	RegToken  string   // One-time registration token for the internal runner
-	CreatedAt time.Time
+	ID          int64
+	Instance    string        // Name of the owning Forgejo instance (routing key)
+	Task        *v1.Task      // Complete Forgejo Task (contains secrets, vars, needs)
+	RegToken    string        // One-time registration token for the internal runner
+	RegTokenTTL time.Duration // Registration-token lifetime (instance reg_token_ttl)
+	CreatedAt   time.Time
 
 	// Mutable fields — protected by mu.
-	mu                 sync.RWMutex
-	status             TaskStatus
-	sessionToken       string        // Session token assigned after successful Register
-	DispatchedAt       time.Time     // When workflow_dispatch succeeded
-	RunnerRegisteredAt time.Time     // When the internal runner completed Register
-	done               chan struct{} // closed when task reaches terminal state
-	registered         chan struct{} // closed when the internal runner completes Register
+	mu           sync.RWMutex
+	status       TaskStatus
+	sessionToken string        // Session token assigned after successful Register
+	done         chan struct{} // closed when task reaches terminal state
+	registered   chan struct{} // closed when the internal runner completes Register
 }
 
 // Status returns the current task status under a read lock.
@@ -86,23 +85,20 @@ func (t *TaskCtx) SessionToken() string {
 	return t.sessionToken
 }
 
-// MarkDispatched transitions the task to StatusDispatched and records the
-// dispatch timestamp under a write lock.
+// MarkDispatched transitions the task to StatusDispatched under a write lock.
 func (t *TaskCtx) MarkDispatched() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.status = StatusDispatched
-	t.DispatchedAt = time.Now()
 }
 
-// MarkRunnerRegistered transitions the task to StatusRunning, records the
-// runner registration timestamp, and closes the registered channel exactly
-// once under a write lock. Safe to call multiple times (idempotent).
+// MarkRunnerRegistered transitions the task to StatusRunning and closes the
+// registered channel exactly once under a write lock. Safe to call multiple
+// times (idempotent).
 func (t *TaskCtx) MarkRunnerRegistered() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.status = StatusRunning
-	t.RunnerRegisteredAt = time.Now()
 	closeSignal(t.ensureRegistered())
 }
 
@@ -188,8 +184,10 @@ type TaskStore interface {
 	// Remove deletes a task and all of its registration-token index entries.
 	Remove(taskID int64)
 
-	// GC removes expired Pending tasks and Terminal tasks that are older
-	// than the configured retention period. now is the caller's current
+	// GC removes Pending tasks whose registration token has outlived its
+	// per-task TTL (now.Sub(CreatedAt) > RegTokenTTL). Terminal tasks are
+	// not retained: every terminal path removes them eagerly, so GC never
+	// keeps a retention branch for them. now is the caller's current
 	// time, typically time.Now().
 	GC(now time.Time)
 

@@ -76,12 +76,15 @@ func (r gcResolver) Resolve(name string) (config.Instance, north.Client, bool) {
 }
 
 // newGCTask builds a TaskCtx in the given status with a controlled age.
+// RegTokenTTL defaults to 15 minutes (the config default) so Pending tasks
+// age out at the production boundary; tests that probe the TTL override it.
 func newGCTask(id int64, instance, regToken string, age time.Duration, status store.TaskStatus) *store.TaskCtx {
 	tc := &store.TaskCtx{
-		ID:        id,
-		Instance:  instance,
-		RegToken:  regToken,
-		CreatedAt: time.Now().Add(-age),
+		ID:          id,
+		Instance:    instance,
+		RegToken:    regToken,
+		RegTokenTTL: 15 * time.Minute,
+		CreatedAt:   time.Now().Add(-age),
 	}
 	tc.SetStatus(status)
 	return tc
@@ -218,7 +221,6 @@ func TestGCOnce_KeepsLongRunningTask(t *testing.T) {
 	taskCtx := newGCTask(15, "inst-a", "reg-15", 3*time.Hour, store.StatusRunning)
 	st.PutPending(taskCtx)
 	s := m.CreateWithToken(taskCtx, "sess-active", "runner", nil)
-	s.CreatedAt = time.Now().Add(-3 * time.Hour)  // session itself is old
 	s.LastActivity = time.Now().Add(-time.Second) // but the runner is active
 
 	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, testLogger())

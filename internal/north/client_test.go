@@ -39,6 +39,10 @@ func testInstance(url string) config.Instance {
 		// inst.HeartbeatInterval as-is, relying on config.applyDefaults
 		// to guarantee a positive value in production.
 		HeartbeatInterval: 30 * time.Second,
+		// Explicit registration-token TTL: the poller stamps it onto
+		// every task it pulls, mirroring config.applyDefaults in
+		// production.
+		RegTokenTTL: 15 * time.Minute,
 	}
 }
 
@@ -702,6 +706,11 @@ func TestAuthFallback_PollLoopFetchTask(t *testing.T) {
 		if taskCtx.ID != 7 {
 			t.Errorf("task id = %d, want 7", taskCtx.ID)
 		}
+		// The registration-token TTL is stamped from the instance at
+		// creation — the task, not the resolver, is the source of truth.
+		if taskCtx.RegTokenTTL != c.inst.RegTokenTTL {
+			t.Errorf("TaskCtx.RegTokenTTL = %v, want %v", taskCtx.RegTokenTTL, c.inst.RegTokenTTL)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for task on taskCh")
 	}
@@ -1362,6 +1371,12 @@ func TestPollLoop_TaskCtxCarriesInstance(t *testing.T) {
 	case taskCtx := <-taskCh:
 		if taskCtx.Instance != "instance-x" {
 			t.Errorf("TaskCtx.Instance = %q, want instance-x", taskCtx.Instance)
+		}
+		// The registration-token TTL must travel on the task so south's
+		// expiry check and the store's Pending GC share one source of
+		// truth with the poller.
+		if taskCtx.RegTokenTTL != c.inst.RegTokenTTL {
+			t.Errorf("TaskCtx.RegTokenTTL = %v, want %v", taskCtx.RegTokenTTL, c.inst.RegTokenTTL)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for task on taskCh")

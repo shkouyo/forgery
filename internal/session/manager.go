@@ -24,21 +24,19 @@ const sessionTokenBytes = 16
 // session token to the task context that the runner is authorized to access,
 // along with metadata declared by the runner during registration.
 //
-// CreatedAt is set once at creation and never modified afterwards; it is kept
-// for diagnostics. LastActivity anchors the Expire deadline that reaps
-// orphaned sessions (see Manager.Expire): it is initialized at creation and
-// refreshed by Manager.Touch on every authenticated RPC, so an active
-// runner's session is continuously renewed.
+// LastActivity anchors the Expire deadline that reaps orphaned sessions (see
+// Manager.Expire): it is initialized at creation and refreshed by
+// Manager.Touch on every authenticated RPC, so an active runner's session is
+// continuously renewed while a silent one ages toward expiry.
 //
-// Neither timestamp is guarded by the manager mutex once the session is
-// handed out; Touch refreshes LastActivity under the manager lock, and Expire
-// reads it under the same lock, so the two never race.
+// LastActivity is not guarded by the manager mutex once the session is
+// handed out; Touch refreshes it under the manager lock, and Expire reads it
+// under the same lock, so the two never race.
 type Session struct {
 	SessionToken string
 	TaskCtx      *store.TaskCtx
 	RunnerName   string
 	Labels       []string
-	CreatedAt    time.Time // fixed at creation, diagnostics only
 	LastActivity time.Time // refreshed by Touch on every authenticated RPC
 }
 
@@ -82,14 +80,12 @@ func (m *Manager) Create(taskCtx *store.TaskCtx, runnerName string, labels []str
 // token is reused as the session token so subsequent RPCs with the same token
 // are recognized.
 func (m *Manager) CreateWithToken(taskCtx *store.TaskCtx, sessionToken string, runnerName string, labels []string) *Session {
-	now := time.Now()
 	session := &Session{
 		SessionToken: sessionToken,
 		TaskCtx:      taskCtx,
 		RunnerName:   runnerName,
 		Labels:       labels,
-		CreatedAt:    now,
-		LastActivity: now,
+		LastActivity: time.Now(),
 	}
 
 	m.mu.Lock()
