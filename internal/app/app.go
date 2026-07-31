@@ -206,7 +206,7 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	// Periodic GC: reaps expired Pending/old Terminal tasks from the store
 	// and expires orphaned runner sessions (see gcLoop and sessionMaxAge).
 	// It exits on ctx cancellation and does not block graceful shutdown.
-	go gcLoop(ctx, gcInterval, taskStore, sessionMgr, sessionMaxAge(cfg), log)
+	go gcLoop(ctx, gcInterval, taskStore, sessionMgr, resolver, sessionMaxAge(cfg), log)
 
 	// One poller per instance, all acquiring from the same shared pool and
 	// feeding the same task channel.
@@ -355,11 +355,19 @@ func sessionMaxAge(cfg *config.Config) time.Duration {
 // gcOnce performs one garbage-collection pass: (a) store.GC reaps expired
 // Pending tasks and Terminal tasks past their retention; (b) Expire drops
 // sessions whose last activity is older than maxAge — i.e. runners that
-// registered but went silent — and for each of them signals the task
-// terminal (MarkDone releases the backpressure slot if HandleTask is still
-// waiting on it) and removes the task from the store. Active sessions never
-// reach maxAge because every authenticated RPC refreshes LastActivity.
-func gcOnce(now time.Time, st store.TaskStore, sessions *session.Manager, maxAge time.Duration, log *slog.Logger) {
+// registered but went silent — and for each of them best-effort reports a
+// failure to the owning Forgejo instance, then forces the task terminal
+// (MarkDone releases the backpressure slot if HandleTask is still waiting
+// on it) and removes the task from the store. Active sessions never reach
+// maxAge because every authenticated RPC refreshes LastActivity.
+//
+// The failure report is best-effort and never retried: a resolve failure or
+// a rejected/rejected-after-re-registration UpdateTask (Forgejo returns
+// "invalid runner for task" when the runner identity no longer owns the
+// task) is logged with the instance name and task id, and local cleanup
+// proceeds as usual — Forgejo's zombie cron marks the task failed on its
+// own schedule (~10-15 minutes) as the backstop.
+func gcOnce(ctx context.Context, now time.Time, st store.TaskStore, sessions *session.Manager, resolver north.Resolver, maxAge time.Duration, log *slog.Logger) {
 	// (a) Store GC: expired Pending / retained Terminal tasks.
 	st.GC(now)
 
@@ -375,6 +383,28 @@ func gcOnce(now time.Time, st store.TaskStore, sessions *session.Manager, maxAge
 			"task_id", taskCtx.ID,
 			"session_token_prefix", tokenPrefix(s.SessionToken),
 		)
+
+		// Best-effort failure report to the owning instance, before local
+		// cleanup: this shortens failure visibility from the zombie cron's
+		// ~10-15 minutes to seconds. Never retried — a rejected update
+		// (e.g. the identity was re-registered since the task was assigned)
+		// is left to the zombie cron, and a blackholed Forgejo must not
+		// stall the GC pass beyond ctx (cancelled at daemon shutdown).
+		if _, client, ok := resolver.Resolve(taskCtx.Instance); ok {
+			if _, err := client.ForwardUpdateTask(ctx, run.FailureUpdateRequest(taskCtx.ID)); err != nil {
+				log.Warn("failed to report orphaned task failure to Forgejo",
+					"instance", taskCtx.Instance,
+					"task_id", taskCtx.ID,
+					"err", err,
+				)
+			}
+		} else {
+			log.Warn("failed to report orphaned task failure to Forgejo: instance not found",
+				"instance", taskCtx.Instance,
+				"task_id", taskCtx.ID,
+			)
+		}
+
 		taskCtx.MarkDone()
 		st.Remove(taskCtx.ID)
 	}
@@ -383,8 +413,10 @@ func gcOnce(now time.Time, st store.TaskStore, sessions *session.Manager, maxAge
 // gcLoop runs gcOnce every interval until ctx is cancelled, then returns.
 // It is the background lifecycle safeguard for tasks and sessions that no
 // other subsystem will clean up (the store GC was previously only exercised
-// by tests, and sessions had no expiry at all).
-func gcLoop(ctx context.Context, interval time.Duration, st store.TaskStore, sessions *session.Manager, maxAge time.Duration, log *slog.Logger) {
+// by tests, and sessions had no expiry at all). ctx bounds the orphan-failure
+// report as well: at shutdown the report is aborted and local cleanup still
+// runs.
+func gcLoop(ctx context.Context, interval time.Duration, st store.TaskStore, sessions *session.Manager, resolver north.Resolver, maxAge time.Duration, log *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -392,7 +424,7 @@ func gcLoop(ctx context.Context, interval time.Duration, st store.TaskStore, ses
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			gcOnce(now, st, sessions, maxAge, log)
+			gcOnce(ctx, now, st, sessions, resolver, maxAge, log)
 		}
 	}
 }

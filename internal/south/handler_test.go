@@ -100,10 +100,6 @@ func (m *mockStore) CountActive() int {
 	return len(m.byID)
 }
 
-func (m *mockStore) HasCapacity(max int) bool {
-	return m.CountActive() < max
-}
-
 func (m *mockStore) wasRemoved(taskID int64) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -409,8 +405,8 @@ func TestRegister_ValidToken(t *testing.T) {
 	if runner.GetToken() == "" {
 		t.Fatal("expected non-empty session token")
 	}
-	if runner.GetId() != 42 {
-		t.Fatalf("expected runner ID 42, got %d", runner.GetId())
+	if runner.GetId() != taskCtx.ID {
+		t.Fatalf("expected runner ID %d (the task ID), got %d", taskCtx.ID, runner.GetId())
 	}
 	if !runner.GetEphemeral() {
 		t.Fatal("expected ephemeral=true")
@@ -428,6 +424,31 @@ func TestRegister_ValidToken(t *testing.T) {
 	}
 	if sess.RunnerName != "test-runner" {
 		t.Fatalf("expected runner name 'test-runner', got %q", sess.RunnerName)
+	}
+}
+
+// TestRegister_RunnerIDIsTaskID pins the compatibility hack: forgejo-runner
+// (one-job) uses the Runner.Id from the Register response as the task ID it
+// reports back in UpdateTask's State.Id, so the response must always carry
+// the task's own ID.
+func TestRegister_RunnerIDIsTaskID(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	regToken := "hack-pin-token"
+	taskCtx := newTaskCtx(ms, 4242, regToken, "inst-a")
+	taskCtx.CreatedAt = time.Now() // fresh token
+
+	req := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
+	resp, err := h.Register(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	if got := resp.Msg.GetRunner().GetId(); got != taskCtx.ID {
+		t.Fatalf("Register response Runner.Id = %d, want the task ID %d", got, taskCtx.ID)
 	}
 }
 

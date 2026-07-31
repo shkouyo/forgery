@@ -186,34 +186,6 @@ func TestCountActive_Empty(t *testing.T) {
 	}
 }
 
-// ---- T-STO-005.5: HasCapacity ----
-
-func TestHasCapacity(t *testing.T) {
-	s := NewMemStore()
-
-	if !s.HasCapacity(5) {
-		t.Fatal("empty store should have capacity")
-	}
-
-	// Add 3 active tasks.
-	for i := int64(1); i <= 3; i++ {
-		s.PutPending(newTestTask(i, "tok"))
-	}
-
-	if !s.HasCapacity(5) {
-		t.Fatal("3 < 5 should have capacity")
-	}
-	if !s.HasCapacity(4) {
-		t.Fatal("3 < 4 should have capacity")
-	}
-	if s.HasCapacity(3) {
-		t.Fatal("3 < 3 should NOT have capacity (strictly less)")
-	}
-	if s.HasCapacity(2) {
-		t.Fatal("3 < 2 should NOT have capacity")
-	}
-}
-
 // ---- T-STO-005.6: GC cleans up expired Pending tasks ----
 
 func TestGC_ExpiredPending(t *testing.T) {
@@ -354,9 +326,6 @@ func TestConcurrentAccess(t *testing.T) {
 				// Count
 				s.CountActive()
 
-				// HasCapacity
-				s.HasCapacity(100)
-
 				// Consume token
 				s.MarkRegTokenConsumed(tok)
 
@@ -379,7 +348,6 @@ func TestConcurrentAccess(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
 			s.CountActive()
-			s.HasCapacity(10)
 			time.Sleep(time.Microsecond)
 		}
 	}()
@@ -861,7 +829,6 @@ func TestConcurrentCountActiveAndPutPending(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < numIter; i++ {
 			s.CountActive()
-			s.HasCapacity(10)
 		}
 	}()
 

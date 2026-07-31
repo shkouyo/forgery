@@ -131,11 +131,18 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 
 	sessionTokenPreview := truncateToken(sess.SessionToken)
 	h.log.Info("runner registered",
+		"instance", taskCtx.Instance,
 		"runner_name", req.Msg.GetName(),
 		"task_id", taskCtx.ID,
 		"token_prefix", sessionTokenPreview,
 		"token_len", len(sess.SessionToken),
 	)
+	// Runner.Id deliberately reuses the task ID. This is a compatibility
+	// hack: forgejo-runner (one-job) aligns the Runner.Id from the Register
+	// response with the State.Id it reports in UpdateTask — the task ID the
+	// internal runner reports back must equal the Runner Id it received
+	// here. Any other value would make its first UpdateTask fail the south
+	// task_id match check.
 	return connect.NewResponse(&v1.RegisterResponse{
 		Runner: &v1.Runner{
 			Id:        taskCtx.ID,
@@ -172,6 +179,7 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 			// terminal UpdateTask path or the GC loop). Treat the request
 			// as unauthenticated.
 			h.log.Warn("session vanished during authentication",
+				"instance", sess.TaskCtx.Instance,
 				"token_prefix", tokenPreview,
 				"token_len", len(token),
 			)
@@ -218,6 +226,7 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 	taskCtx.MarkRunnerRegistered()
 
 	h.log.Info("runner auto-registered (one-job mode)",
+		"instance", taskCtx.Instance,
 		"task_id", taskCtx.ID,
 		"token_prefix", tokenPreview,
 	)
@@ -251,6 +260,7 @@ func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRe
 	}
 
 	h.log.Info("runner declared",
+		"instance", sess.TaskCtx.Instance,
 		"runner_name", sess.RunnerName,
 		"version", req.Msg.GetVersion(),
 		"task_id", sess.TaskCtx.ID,
@@ -279,6 +289,7 @@ func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTa
 	}
 
 	h.log.Info("task fetched",
+		"instance", sess.TaskCtx.Instance,
 		"task_id", sess.TaskCtx.ID,
 		"runner_name", sess.RunnerName,
 	)
@@ -327,6 +338,7 @@ func (h *Handler) UpdateTask(ctx context.Context, req *connect.Request[v1.Update
 		h.store.Remove(taskCtx.ID)
 
 		h.log.Info("task terminal, cleaned up",
+			"instance", taskCtx.Instance,
 			"task_id", taskCtx.ID,
 			"result", result.String(),
 		)

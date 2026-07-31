@@ -196,8 +196,4 @@ type TaskStore interface {
 	// CountActive returns the number of tasks that are not in
 	// StatusTerminal.
 	CountActive() int
-
-	// HasCapacity returns true when the number of active tasks is strictly
-	// less than max.
-	HasCapacity(max int) bool
 }

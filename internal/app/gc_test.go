@@ -1,12 +1,19 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	v1 "code.gitea.io/actions-proto-go/runner/v1"
+
 	"git.0x0f.dev/forgery/internal/config"
+	"git.0x0f.dev/forgery/internal/north"
 	"git.0x0f.dev/forgery/internal/session"
 	"git.0x0f.dev/forgery/internal/store"
 )
@@ -15,6 +22,57 @@ import (
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
+}
+
+// newBufferLogger returns a text logger writing into a buffer, for asserting
+// log content (e.g. the orphan-failure WARN) in GC tests.
+func newBufferLogger() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
+}
+
+// gcClient implements north.Client for GC tests: it records every
+// ForwardUpdateTask request and can be configured to fail the report.
+type gcClient struct {
+	mu         sync.Mutex
+	forwarded  []*v1.UpdateTaskRequest
+	forwardErr error
+}
+
+func (c *gcClient) ForwardUpdateTask(_ context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forwarded = append(c.forwarded, req)
+	if c.forwardErr != nil {
+		return nil, c.forwardErr
+	}
+	return &v1.UpdateTaskResponse{}, nil
+}
+
+func (c *gcClient) ForwardUpdateLog(_ context.Context, _ *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error) {
+	return &v1.UpdateLogResponse{}, nil
+}
+
+func (c *gcClient) StartHeartbeat(ctx context.Context, _ *store.TaskCtx) {
+	<-ctx.Done()
+}
+
+func (c *gcClient) calls() []*v1.UpdateTaskRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]*v1.UpdateTaskRequest(nil), c.forwarded...)
+}
+
+// gcResolver is a static instance-name → client map implementing
+// north.Resolver for GC tests. An empty map makes every Resolve fail.
+type gcResolver map[string]north.Client
+
+func (r gcResolver) Resolve(name string) (config.Instance, north.Client, bool) {
+	c, ok := r[name]
+	if !ok {
+		return config.Instance{}, nil, false
+	}
+	return config.Instance{Name: name}, c, true
 }
 
 // newGCTask builds a TaskCtx in the given status with a controlled age.
@@ -62,7 +120,7 @@ func TestGCOnce_ExpiredPendingCleared(t *testing.T) {
 	st.PutPending(expired)
 	st.PutPending(fresh)
 
-	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, testLogger())
 
 	if _, ok := st.GetByID(1); ok {
 		t.Error("expired Pending task should have been removed by gcOnce")
@@ -84,7 +142,7 @@ func TestGCOnce_ExpiredSession_TerminatesAndRemovesTask(t *testing.T) {
 	st.PutPending(taskCtx)
 	s := newOrphanedSession(m, taskCtx, 2*time.Hour)
 
-	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, testLogger())
 
 	// Session deleted.
 	if _, ok := m.Lookup(s.SessionToken); ok {
@@ -114,7 +172,7 @@ func TestGCOnce_ExpiredSession_AlreadyRemovedTask(t *testing.T) {
 	s := newOrphanedSession(m, taskCtx, 2*time.Hour)
 	st.Remove(taskCtx.ID) // task gone, session orphaned
 
-	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, testLogger())
 
 	if _, ok := m.Lookup(s.SessionToken); ok {
 		t.Error("orphaned session should have been removed")
@@ -138,7 +196,7 @@ func TestGCOnce_KeepsFreshSessionAndTask(t *testing.T) {
 	st.PutPending(taskCtx)
 	s := m.CreateWithToken(taskCtx, "sess-fresh", "runner", nil) // fresh: now
 
-	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, testLogger())
 
 	if _, ok := m.Lookup(s.SessionToken); !ok {
 		t.Error("fresh session must survive gcOnce")
@@ -163,7 +221,7 @@ func TestGCOnce_KeepsLongRunningTask(t *testing.T) {
 	s.CreatedAt = time.Now().Add(-3 * time.Hour)  // session itself is old
 	s.LastActivity = time.Now().Add(-time.Second) // but the runner is active
 
-	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, testLogger())
 
 	if _, ok := m.Lookup(s.SessionToken); !ok {
 		t.Error("active session of a long-running task was expired")
@@ -178,9 +236,129 @@ func TestGCOnce_KeepsLongRunningTask(t *testing.T) {
 	}
 }
 
+// TestGCOnce_ExpiredSession_ReportsFailureToForgejo verifies the F8 fix: an
+// expired orphan session triggers exactly one failure report to the owning
+// instance's client, carrying the task id and RESULT_FAILURE, followed by the
+// usual local cleanup.
+func TestGCOnce_ExpiredSession_ReportsFailureToForgejo(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+	client := &gcClient{}
+	resolver := gcResolver{"inst-a": client}
+
+	taskCtx := newGCTask(7, "inst-a", "reg-7", time.Hour, store.StatusRunning)
+	st.PutPending(taskCtx)
+	s := newOrphanedSession(m, taskCtx, 2*time.Hour)
+
+	gcOnce(context.Background(), time.Now(), st, m, resolver, time.Hour, testLogger())
+
+	// Exactly one failure report, for this task, with RESULT_FAILURE.
+	calls := client.calls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 failure report, got %d", len(calls))
+	}
+	if got := calls[0].GetState().GetId(); got != 7 {
+		t.Errorf("reported task id = %d, want 7", got)
+	}
+	if got := calls[0].GetState().GetResult(); got != v1.Result_RESULT_FAILURE {
+		t.Errorf("reported result = %v, want RESULT_FAILURE", got)
+	}
+
+	// Local cleanup still happened.
+	if _, ok := m.Lookup(s.SessionToken); ok {
+		t.Error("expired session should have been removed")
+	}
+	if _, ok := st.GetByID(7); ok {
+		t.Error("task of expired session should have been removed")
+	}
+	select {
+	case <-taskCtx.Done():
+		// OK
+	default:
+		t.Error("task Done channel should be closed after session expiry")
+	}
+}
+
+// TestGCOnce_ExpiredSession_ReportFailureStillCleansUp verifies the
+// best-effort contract: when the failure report itself fails (e.g. Forgejo
+// rejects the update because the runner identity was re-registered), the
+// error is logged with the instance and task id, but MarkDone and Remove
+// still run — the report is never retried and never blocks cleanup.
+func TestGCOnce_ExpiredSession_ReportFailureStillCleansUp(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+	client := &gcClient{forwardErr: errors.New("invalid runner for task")}
+	logger, buf := newBufferLogger()
+
+	taskCtx := newGCTask(7, "inst-a", "reg-7", time.Hour, store.StatusRunning)
+	st.PutPending(taskCtx)
+	s := newOrphanedSession(m, taskCtx, 2*time.Hour)
+
+	gcOnce(context.Background(), time.Now(), st, m, gcResolver{"inst-a": client}, time.Hour, logger)
+
+	// Cleanup is unconditional: session gone, task gone, Done closed.
+	if _, ok := m.Lookup(s.SessionToken); ok {
+		t.Error("expired session should have been removed despite failed report")
+	}
+	if _, ok := st.GetByID(7); ok {
+		t.Error("task should have been removed despite failed report")
+	}
+	select {
+	case <-taskCtx.Done():
+		// OK
+	default:
+		t.Error("task Done channel should be closed despite failed report")
+	}
+	// The failure is logged with instance and task id for the operator.
+	out := buf.String()
+	if !strings.Contains(out, "failed to report orphaned task failure") {
+		t.Errorf("expected WARN about the failed report, got: %s", out)
+	}
+	if !strings.Contains(out, "task_id=7") {
+		t.Errorf("expected task id in the report-failure log, got: %s", out)
+	}
+}
+
+// TestGCOnce_ExpiredSession_UnknownInstanceStillCleansUp verifies the
+// defensive path: when the task's instance cannot be resolved (no client to
+// report to), gcOnce logs the instance and task id and still performs the
+// local cleanup.
+func TestGCOnce_ExpiredSession_UnknownInstanceStillCleansUp(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+	logger, buf := newBufferLogger()
+
+	taskCtx := newGCTask(7, "ghost-instance", "reg-7", time.Hour, store.StatusRunning)
+	st.PutPending(taskCtx)
+	s := newOrphanedSession(m, taskCtx, 2*time.Hour)
+
+	// Empty resolver: Resolve("ghost-instance") fails.
+	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, logger)
+
+	if _, ok := m.Lookup(s.SessionToken); ok {
+		t.Error("expired session should have been removed")
+	}
+	if _, ok := st.GetByID(7); ok {
+		t.Error("task should have been removed despite unresolvable instance")
+	}
+	select {
+	case <-taskCtx.Done():
+		// OK
+	default:
+		t.Error("task Done channel should be closed despite unresolvable instance")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "instance not found") {
+		t.Errorf("expected WARN about the unresolvable instance, got: %s", out)
+	}
+	if !strings.Contains(out, "task_id=7") {
+		t.Errorf("expected task id in the unresolved-instance log, got: %s", out)
+	}
+}
+
 // TestGCOnce_Empty verifies the pass is safe on empty state.
 func TestGCOnce_Empty(t *testing.T) {
-	gcOnce(time.Now(), store.NewMemStore(), session.NewManager(), time.Hour, testLogger())
+	gcOnce(context.Background(), time.Now(), store.NewMemStore(), session.NewManager(), gcResolver{}, time.Hour, testLogger())
 }
 
 // ── sessionMaxAge ──
@@ -215,7 +393,7 @@ func TestGCLoop_TicksAndCleans(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		gcLoop(ctx, 10*time.Millisecond, st, m, time.Hour, testLogger())
+		gcLoop(ctx, 10*time.Millisecond, st, m, gcResolver{}, time.Hour, testLogger())
 		close(done)
 	}()
 
@@ -250,7 +428,7 @@ func TestGCLoop_AlreadyCancelled(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		gcLoop(ctx, time.Millisecond, store.NewMemStore(), session.NewManager(), time.Hour, testLogger())
+		gcLoop(ctx, time.Millisecond, store.NewMemStore(), session.NewManager(), gcResolver{}, time.Hour, testLogger())
 		close(done)
 	}()
 

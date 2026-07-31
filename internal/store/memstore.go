@@ -189,9 +189,3 @@ func (m *MemStore) CountActive() int {
 	}
 	return count
 }
-
-// HasCapacity returns true when the number of active tasks is strictly less
-// than max.
-func (m *MemStore) HasCapacity(max int) bool {
-	return m.CountActive() < max
-}

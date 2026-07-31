@@ -65,8 +65,12 @@ func New(pool *slots.Pool, dp *dispatch.Dispatcher, st store.TaskStore, resolver
 	}
 }
 
-// failureUpdateRequest builds an UpdateTaskRequest with RESULT_FAILURE for the given task ID.
-func failureUpdateRequest(taskID int64) *v1.UpdateTaskRequest {
+// FailureUpdateRequest builds an UpdateTaskRequest with RESULT_FAILURE for the
+// given task ID. It is the single construction site for failure payloads,
+// shared by the run module (dispatch failure, GA startup timeout) and the app
+// GC loop (orphaned session expiry) so the report is built in exactly one
+// place.
+func FailureUpdateRequest(taskID int64) *v1.UpdateTaskRequest {
 	return &v1.UpdateTaskRequest{
 		State: &v1.TaskState{
 			Id:     taskID,
@@ -120,7 +124,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		r.log.Error("dispatch failed", "task_id", taskCtx.ID, "err", err)
 
 		// Report failure to Forgejo.
-		client.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
+		client.ForwardUpdateTask(ctx, FailureUpdateRequest(taskCtx.ID))
 
 		// Drop any session bound to this task (normally none yet — the
 		// runner cannot register before dispatch succeeds — but a race
@@ -185,7 +189,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		hbCancel()
 
 		// Report failure to Forgejo.
-		client.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
+		client.ForwardUpdateTask(ctx, FailureUpdateRequest(taskCtx.ID))
 
 		// Drop the runner's session if one was created in a race with this
 		// branch (a one-job auto-registration landing a moment before the
