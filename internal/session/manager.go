@@ -3,8 +3,8 @@
 // receives a session token, and all subsequent RPCs (Declare, FetchTask,
 // UpdateTask, UpdateLog) are authenticated via that session token.
 //
-// The Manager provides concurrency-safe Create, Lookup, Touch, Update,
-// Remove, and Expire operations backed by a map protected with sync.RWMutex.
+// The Manager provides concurrency-safe Create, Lookup, Touch, Remove,
+// and Expire operations backed by a map protected with sync.RWMutex.
 package session
 
 import (
@@ -121,17 +121,6 @@ func (m *Manager) Touch(sessionToken string) bool {
 	}
 	s.LastActivity = time.Now()
 	return true
-}
-
-// Update updates the runner name and labels for an existing session.
-// It is a no-op if the session does not exist.
-func (m *Manager) Update(sessionToken string, runnerName string, labels []string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s, ok := m.sessions[sessionToken]; ok {
-		s.RunnerName = runnerName
-		s.Labels = labels
-	}
 }
 
 // Remove deletes the session identified by sessionToken from the manager. It is

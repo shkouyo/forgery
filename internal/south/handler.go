@@ -116,7 +116,7 @@ func (h *Handler) Register(ctx context.Context, req *connect.Request[v1.Register
 	}
 
 	// Atomically consume the token — it can only be used once.
-	if err := h.store.MarkRegTokenConsumed(regToken); err != nil {
+	if !h.store.MarkRegTokenConsumed(regToken) {
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token already consumed"))
 	}
 
@@ -200,7 +200,7 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 	}
 
 	// Atomically consume the registration token.
-	if err := h.store.MarkRegTokenConsumed(token); err != nil {
+	if !h.store.MarkRegTokenConsumed(token) {
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("registration token already consumed"))
 	}
 
@@ -235,17 +235,18 @@ func (h *Handler) Declare(ctx context.Context, req *connect.Request[v1.DeclareRe
 	}
 
 	// Update session metadata from Declare request (runner name and labels
-	// are set here when Register was skipped, e.g. one-job mode).
+	// are set here when Register was skipped, e.g. one-job mode). This is
+	// the only write path for these fields: the session pointer returned
+	// by authenticate is owned by this handler, so the direct field
+	// assignment is safe without a manager lock.
 	labels := req.Msg.GetLabels()
 	if len(labels) > 0 {
-		h.sessions.Update(sess.SessionToken, sess.RunnerName, labels)
 		sess.Labels = labels
 	}
 	// Set a default runner name if none was provided (one-job mode).
 	runnerName := sess.RunnerName
 	if runnerName == "" {
 		runnerName = "one-job-runner"
-		h.sessions.Update(sess.SessionToken, runnerName, sess.Labels)
 		sess.RunnerName = runnerName
 	}
 

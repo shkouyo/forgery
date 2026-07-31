@@ -317,7 +317,7 @@ func TestHandleTask_DispatchFailure(t *testing.T) {
 	}
 
 	// Verify task was removed from store.
-	if _, ok := st.GetByID(99); ok {
+	if st.CountActive() != 0 {
 		t.Error("task should have been removed from store")
 	}
 
@@ -375,7 +375,7 @@ func TestHandleTask_Timeout(t *testing.T) {
 	}
 
 	// Verify task removed.
-	if _, ok := st.GetByID(7); ok {
+	if st.CountActive() != 0 {
 		t.Error("task should have been removed from store after timeout")
 	}
 }
@@ -459,7 +459,7 @@ func TestHandleTask_RegisteredSurvivesStartupTimeout(t *testing.T) {
 	if len(sess.removedTokens()) != 0 {
 		t.Fatalf("session removed after startup timeout despite runner registered: %v", sess.removedTokens())
 	}
-	if _, ok := st.GetByID(13); !ok {
+	if st.CountActive() != 1 {
 		t.Fatal("task removed from store after startup timeout despite runner registered")
 	}
 	if slotFree(t, pool) {
@@ -576,7 +576,7 @@ func TestHandleTask_ContextCancellation_UnregisteredCleansUp(t *testing.T) {
 
 	// A never-registered task must be removed from the store so the drain
 	// phase completes (re-assignment happens on the Forgejo side).
-	if _, ok := st.GetByID(3); ok {
+	if st.CountActive() != 0 {
 		t.Error("unregistered task should be removed from store on shutdown")
 	}
 
@@ -641,7 +641,7 @@ func TestHandleTask_ContextCancellation_RegisteredStaysInStore(t *testing.T) {
 
 	// A registered task must stay in the store: the drain phase waits for
 	// its terminal state or the drain timeout.
-	if _, ok := st.GetByID(4); !ok {
+	if st.CountActive() != 1 {
 		t.Error("registered task should remain in store after context cancellation (drain waits for it)")
 	}
 
@@ -687,7 +687,7 @@ func TestHandleTask_UnknownInstance(t *testing.T) {
 	if !slotFree(t, pool) {
 		t.Fatal("slot not released for unresolvable instance")
 	}
-	if _, ok := st.GetByID(11); ok {
+	if st.CountActive() != 0 {
 		t.Error("task should have been removed from store")
 	}
 }
@@ -772,7 +772,7 @@ func TestHandleTask_MultiInstanceRouting(t *testing.T) {
 	if !slotFree(t, pool) {
 		t.Fatal("slot not released after inst-b timeout")
 	}
-	if _, ok := st.GetByID(77); ok {
+	if st.CountActive() != 0 {
 		t.Error("task should have been removed from store after inst-b timeout")
 	}
 }

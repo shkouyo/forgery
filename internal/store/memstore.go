@@ -55,24 +55,17 @@ func (m *MemStore) GetByRegToken(regToken string) (*TaskCtx, bool) {
 }
 
 // MarkRegTokenConsumed atomically removes the registration token from the
-// index so it can never be used again. Returns ErrTokenNotFound when the
-// token was never stored or has already been consumed.
-func (m *MemStore) MarkRegTokenConsumed(regToken string) error {
+// index so it can never be used again. It returns true when the token
+// existed and was consumed, false when the token was never stored or has
+// already been consumed.
+func (m *MemStore) MarkRegTokenConsumed(regToken string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.byReg[regToken]; !ok {
-		return ErrTokenNotFound
+		return false
 	}
 	delete(m.byReg, regToken)
-	return nil
-}
-
-// GetByID looks up a task by its real Forgejo task id.
-func (m *MemStore) GetByID(taskID int64) (*TaskCtx, bool) {
-	m.mu.RLock()
-	taskCtx, ok := m.tasks[taskID]
-	m.mu.RUnlock()
-	return taskCtx, ok
+	return true
 }
 
 // Remove deletes the task and cleans up every registration-token index entry

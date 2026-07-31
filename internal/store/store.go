@@ -5,7 +5,6 @@
 package store
 
 import (
-	"errors"
 	"sync"
 	"time"
 
@@ -28,11 +27,6 @@ const (
 	// StatusTerminal — task completed (success, failure, or cancelled).
 	StatusTerminal
 )
-
-// ErrTokenNotFound is returned by MarkRegTokenConsumed when the supplied
-// registration token does not exist in the store (never stored or already
-// consumed).
-var ErrTokenNotFound = errors.New("store: registration token not found")
 
 // TaskCtx carries the full context of a single Forgejo task through the
 // forgery proxy pipeline. Immutable fields are set at creation and never
@@ -174,12 +168,11 @@ type TaskStore interface {
 	GetByRegToken(regToken string) (*TaskCtx, bool)
 
 	// MarkRegTokenConsumed atomically removes the registration token from
-	// the index so it cannot be used again. Returns ErrTokenNotFound if
-	// the token was never stored or was already consumed.
-	MarkRegTokenConsumed(regToken string) error
-
-	// GetByID looks up a task by its real Forgejo task id.
-	GetByID(taskID int64) (*TaskCtx, bool)
+	// the index so it can never be used again: the token is one-time, and
+	// a concurrent consumer either wins it or loses it. It returns true
+	// when the token existed and was consumed, false when it was never
+	// stored or had already been consumed.
+	MarkRegTokenConsumed(regToken string) bool
 
 	// Remove deletes a task and all of its registration-token index entries.
 	Remove(taskID int64)

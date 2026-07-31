@@ -125,10 +125,10 @@ func TestGCOnce_ExpiredPendingCleared(t *testing.T) {
 
 	gcOnce(context.Background(), time.Now(), st, m, gcResolver{}, time.Hour, testLogger())
 
-	if _, ok := st.GetByID(1); ok {
+	if _, ok := st.GetByRegToken("reg-1"); ok {
 		t.Error("expired Pending task should have been removed by gcOnce")
 	}
-	if _, ok := st.GetByID(2); !ok {
+	if _, ok := st.GetByRegToken("reg-2"); !ok {
 		t.Error("fresh Pending task must survive gcOnce")
 	}
 }
@@ -152,7 +152,7 @@ func TestGCOnce_ExpiredSession_TerminatesAndRemovesTask(t *testing.T) {
 		t.Error("expired session should have been removed")
 	}
 	// Task removed from store.
-	if _, ok := st.GetByID(7); ok {
+	if st.CountActive() != 0 {
 		t.Error("task of expired session should have been removed")
 	}
 	// Task forced terminal: Done channel closed.
@@ -204,7 +204,7 @@ func TestGCOnce_KeepsFreshSessionAndTask(t *testing.T) {
 	if _, ok := m.Lookup(s.SessionToken); !ok {
 		t.Error("fresh session must survive gcOnce")
 	}
-	if _, ok := st.GetByID(9); !ok {
+	if st.CountActive() != 1 {
 		t.Error("fresh running task must survive gcOnce")
 	}
 }
@@ -228,7 +228,7 @@ func TestGCOnce_KeepsLongRunningTask(t *testing.T) {
 	if _, ok := m.Lookup(s.SessionToken); !ok {
 		t.Error("active session of a long-running task was expired")
 	}
-	if _, ok := st.GetByID(15); !ok {
+	if st.CountActive() != 1 {
 		t.Error("long-running task was removed by gcOnce")
 	}
 	select {
@@ -270,7 +270,7 @@ func TestGCOnce_ExpiredSession_ReportsFailureToForgejo(t *testing.T) {
 	if _, ok := m.Lookup(s.SessionToken); ok {
 		t.Error("expired session should have been removed")
 	}
-	if _, ok := st.GetByID(7); ok {
+	if st.CountActive() != 0 {
 		t.Error("task of expired session should have been removed")
 	}
 	select {
@@ -302,7 +302,7 @@ func TestGCOnce_ExpiredSession_ReportFailureStillCleansUp(t *testing.T) {
 	if _, ok := m.Lookup(s.SessionToken); ok {
 		t.Error("expired session should have been removed despite failed report")
 	}
-	if _, ok := st.GetByID(7); ok {
+	if st.CountActive() != 0 {
 		t.Error("task should have been removed despite failed report")
 	}
 	select {
@@ -340,7 +340,7 @@ func TestGCOnce_ExpiredSession_UnknownInstanceStillCleansUp(t *testing.T) {
 	if _, ok := m.Lookup(s.SessionToken); ok {
 		t.Error("expired session should have been removed")
 	}
-	if _, ok := st.GetByID(7); ok {
+	if st.CountActive() != 0 {
 		t.Error("task should have been removed despite unresolvable instance")
 	}
 	select {

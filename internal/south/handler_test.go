@@ -30,7 +30,7 @@ type mockStore struct {
 	byID            map[int64]*store.TaskCtx  // keyed by task ID
 	consumedTokens  map[string]bool           // tracks which tokens were consumed
 	removed         map[int64]bool            // tracks which task IDs were removed
-	markErr         error                     // error to return from MarkRegTokenConsumed
+	markOK          bool                      // override: force false from MarkRegTokenConsumed
 	getByRegTokenOk bool                      // override: force false from GetByRegToken
 }
 
@@ -40,6 +40,7 @@ func newMockStore() *mockStore {
 		byID:            make(map[int64]*store.TaskCtx),
 		consumedTokens:  make(map[string]bool),
 		removed:         make(map[int64]bool),
+		markOK:          true,
 		getByRegTokenOk: true,
 	}
 }
@@ -61,28 +62,21 @@ func (m *mockStore) GetByRegToken(regToken string) (*store.TaskCtx, bool) {
 	return tc, ok
 }
 
-func (m *mockStore) MarkRegTokenConsumed(regToken string) error {
+func (m *mockStore) MarkRegTokenConsumed(regToken string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.markErr != nil {
-		return m.markErr
+	if !m.markOK {
+		return false
 	}
 	if m.consumedTokens[regToken] {
-		return store.ErrTokenNotFound
+		return false
 	}
 	if _, ok := m.tasks[regToken]; !ok {
-		return store.ErrTokenNotFound
+		return false
 	}
 	m.consumedTokens[regToken] = true
 	delete(m.tasks, regToken)
-	return nil
-}
-
-func (m *mockStore) GetByID(taskID int64) (*store.TaskCtx, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	tc, ok := m.byID[taskID]
-	return tc, ok
+	return true
 }
 
 func (m *mockStore) Remove(taskID int64) {

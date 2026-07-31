@@ -60,8 +60,8 @@ func TestMarkRegTokenConsumed(t *testing.T) {
 	s.PutPending(tc)
 
 	// First consumption should succeed.
-	if err := s.MarkRegTokenConsumed("token-one"); err != nil {
-		t.Fatalf("first MarkRegTokenConsumed failed: %v", err)
+	if !s.MarkRegTokenConsumed("token-one") {
+		t.Fatal("first MarkRegTokenConsumed should succeed")
 	}
 
 	// Token should no longer be findable.
@@ -70,16 +70,15 @@ func TestMarkRegTokenConsumed(t *testing.T) {
 		t.Fatal("GetByRegToken should return false after token consumed")
 	}
 
-	// Second consumption should return ErrTokenNotFound.
-	err := s.MarkRegTokenConsumed("token-one")
-	if err != ErrTokenNotFound {
-		t.Fatalf("expected ErrTokenNotFound on double-consume, got %v", err)
+	// Second consumption should fail (token already consumed).
+	if s.MarkRegTokenConsumed("token-one") {
+		t.Fatal("second consume should return false")
 	}
 
-	// Task should still exist by ID.
-	got, ok := s.GetByID(1)
+	// Task should still exist in the tasks map.
+	got, ok := s.tasks[1]
 	if !ok {
-		t.Fatal("GetByID should still find task after token consumed")
+		t.Fatal("task should still be present after token consumed")
 	}
 	if got.ID != 1 {
 		t.Fatalf("expected ID 1, got %d", got.ID)
@@ -88,9 +87,8 @@ func TestMarkRegTokenConsumed(t *testing.T) {
 
 func TestMarkRegTokenConsumed_UnknownToken(t *testing.T) {
 	s := NewMemStore()
-	err := s.MarkRegTokenConsumed("never-stored")
-	if err != ErrTokenNotFound {
-		t.Fatalf("expected ErrTokenNotFound, got %v", err)
+	if s.MarkRegTokenConsumed("never-stored") {
+		t.Fatal("MarkRegTokenConsumed should return false for a token that was never stored")
 	}
 }
 
@@ -102,8 +100,8 @@ func TestRemove(t *testing.T) {
 	s.PutPending(tc)
 
 	// Verify it exists.
-	if _, ok := s.GetByID(10); !ok {
-		t.Fatal("GetByID should find task before Remove")
+	if _, ok := s.tasks[10]; !ok {
+		t.Fatal("task should be in the tasks map before Remove")
 	}
 	if _, ok := s.GetByRegToken("tok-10"); !ok {
 		t.Fatal("GetByRegToken should find task before Remove")
@@ -112,8 +110,8 @@ func TestRemove(t *testing.T) {
 	s.Remove(10)
 
 	// Both lookups should fail.
-	if _, ok := s.GetByID(10); ok {
-		t.Fatal("GetByID should return false after Remove")
+	if _, ok := s.tasks[10]; ok {
+		t.Fatal("task should be gone from the tasks map after Remove")
 	}
 	if _, ok := s.GetByRegToken("tok-10"); ok {
 		t.Fatal("GetByRegToken should return false after Remove")
@@ -143,7 +141,7 @@ func TestRemove_CleansUpAllRegTokens(t *testing.T) {
 	if _, ok := s.GetByRegToken("tok-20-new"); ok {
 		t.Fatal("reg token should be cleaned up by Remove")
 	}
-	if _, ok := s.GetByID(20); ok {
+	if _, ok := s.tasks[20]; ok {
 		t.Fatal("task should be gone after Remove")
 	}
 }
@@ -209,7 +207,7 @@ func TestGC_ExpiredPending(t *testing.T) {
 	s.GC(time.Now())
 
 	// Old task should be gone.
-	if _, ok := s.GetByID(1); ok {
+	if _, ok := s.tasks[1]; ok {
 		t.Fatal("expired pending task should be removed by GC")
 	}
 	if _, ok := s.GetByRegToken("old-tok"); ok {
@@ -217,7 +215,7 @@ func TestGC_ExpiredPending(t *testing.T) {
 	}
 
 	// Fresh task should remain.
-	if _, ok := s.GetByID(2); !ok {
+	if _, ok := s.tasks[2]; !ok {
 		t.Fatal("fresh pending task should survive GC")
 	}
 	if _, ok := s.GetByRegToken("fresh-tok"); !ok {
@@ -235,7 +233,7 @@ func TestGC_PendingNotExpired(t *testing.T) {
 
 	s.GC(time.Now())
 
-	if _, ok := s.GetByID(1); !ok {
+	if _, ok := s.tasks[1]; !ok {
 		t.Fatal("pending task within its RegTokenTTL should survive GC")
 	}
 }
@@ -256,7 +254,7 @@ func TestGC_TerminalTasksSurvive(t *testing.T) {
 
 	s.GC(time.Now())
 
-	if _, ok := s.GetByID(1); !ok {
+	if _, ok := s.tasks[1]; !ok {
 		t.Fatal("terminal task must survive GC (removal is the terminal path's job)")
 	}
 }
@@ -278,10 +276,10 @@ func TestGC_DispatchedAndRunningSurvive(t *testing.T) {
 
 	s.GC(time.Now())
 
-	if _, ok := s.GetByID(1); !ok {
+	if _, ok := s.tasks[1]; !ok {
 		t.Fatal("old Dispatched task should survive GC")
 	}
-	if _, ok := s.GetByID(2); !ok {
+	if _, ok := s.tasks[2]; !ok {
 		t.Fatal("old Running task should survive GC")
 	}
 }
@@ -320,9 +318,6 @@ func TestConcurrentAccess(t *testing.T) {
 
 				// Get by token
 				s.GetByRegToken(tok)
-
-				// Get by ID
-				s.GetByID(id)
 
 				// Count
 				s.CountActive()
@@ -364,28 +359,18 @@ func TestRegTokenDoubleUse(t *testing.T) {
 	s.PutPending(tc)
 
 	// First consumption succeeds.
-	if err := s.MarkRegTokenConsumed("shared-token"); err != nil {
-		t.Fatalf("first consume should succeed: %v", err)
+	if !s.MarkRegTokenConsumed("shared-token") {
+		t.Fatal("first consume should succeed")
 	}
 
 	// Second consumption must fail.
-	if err := s.MarkRegTokenConsumed("shared-token"); err != ErrTokenNotFound {
-		t.Fatalf("second consume should return ErrTokenNotFound, got %v", err)
+	if s.MarkRegTokenConsumed("shared-token") {
+		t.Fatal("second consume should return false")
 	}
 
 	// Lookup by token must fail after first consumption.
 	if _, ok := s.GetByRegToken("shared-token"); ok {
 		t.Fatal("GetByRegToken should fail after token consumed")
-	}
-}
-
-// ---- Additional edge case: GetByID returns false when task never existed ----
-
-func TestGetByID_NotFound(t *testing.T) {
-	s := NewMemStore()
-	_, ok := s.GetByID(12345)
-	if ok {
-		t.Fatal("GetByID should return false for unknown id")
 	}
 }
 
@@ -642,10 +627,10 @@ func TestGC_PendingTTLByTask(t *testing.T) {
 
 	s.GC(time.Now())
 
-	if _, ok := s.GetByID(1); ok {
+	if _, ok := s.tasks[1]; ok {
 		t.Fatal("pending task past its RegTokenTTL should be removed by GC")
 	}
-	if _, ok := s.GetByID(2); !ok {
+	if _, ok := s.tasks[2]; !ok {
 		t.Fatal("pending task within its RegTokenTTL should survive GC")
 	}
 }
@@ -663,7 +648,7 @@ func TestGC_PendingWithinTTL_Survives(t *testing.T) {
 
 	s.GC(time.Now())
 
-	if _, ok := s.GetByID(1); !ok {
+	if _, ok := s.tasks[1]; !ok {
 		t.Fatal("pending task within its RegTokenTTL should survive GC")
 	}
 }
@@ -732,7 +717,7 @@ func TestConcurrentMarkRegTokenConsumedAndGetByRegToken(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// Try to consume — only one should succeed.
-			if err := s.MarkRegTokenConsumed("shared-token"); err == nil {
+			if s.MarkRegTokenConsumed("shared-token") {
 				atomic.AddInt32(&consumed, 1)
 			}
 			// Also look up the token.
@@ -789,10 +774,6 @@ func TestConcurrentRemoveAndGC(t *testing.T) {
 	// After both finish, all tasks should be gone (or at least not panic).
 	// Just verify the store is consistent — no dangling byReg entries
 	// pointing to removed tasks.
-	for i := int64(1); i <= numTasks; i++ {
-		// GetByID may or may not find the task — either is fine.
-		s.GetByID(i)
-	}
 	// Verify count doesn't panic.
 	_ = s.CountActive()
 }
@@ -840,7 +821,7 @@ func TestGC_CleansUpBothMaps(t *testing.T) {
 	s.GC(time.Now())
 
 	// Both maps should be cleaned.
-	if _, ok := s.GetByID(1); ok {
+	if _, ok := s.tasks[1]; ok {
 		t.Fatal("task should be removed from tasks map")
 	}
 	if _, ok := s.GetByRegToken("expired-tok"); ok {
@@ -869,7 +850,7 @@ func TestGC_MultipleRegTokensForSameTask(t *testing.T) {
 	if _, ok := s.GetByRegToken("tok-2"); ok {
 		t.Fatal("tok-2 should be cleaned by GC")
 	}
-	if _, ok := s.GetByID(1); ok {
+	if _, ok := s.tasks[1]; ok {
 		t.Fatal("task should be removed from tasks map")
 	}
 }
