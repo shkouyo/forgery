@@ -107,16 +107,16 @@ func TestTaskCtx_SetSessionToken_CalledDuringCreate(t *testing.T) {
 	taskCtx := newTaskCtx(4, "reg-token-4")
 
 	// Before Create, SessionToken should be empty.
-	if taskCtx.SessionToken != "" {
+	if taskCtx.SessionToken() != "" {
 		t.Fatal("expected empty SessionToken before Create")
 	}
 
 	session := m.Create(taskCtx, "runner-4", nil)
 
-	// After Create, TaskCtx.SessionToken must match the session token.
-	if taskCtx.SessionToken != session.SessionToken {
-		t.Fatalf("TaskCtx.SessionToken = %q, want %q",
-			taskCtx.SessionToken, session.SessionToken)
+	// After Create, TaskCtx.SessionToken() must match the session token.
+	if taskCtx.SessionToken() != session.SessionToken {
+		t.Fatalf("TaskCtx.SessionToken() = %q, want %q",
+			taskCtx.SessionToken(), session.SessionToken)
 	}
 }
 

@@ -150,7 +150,7 @@ default_container_image = "docker://ghcr.io/catthehacker/ubuntu:act-latest"
 
 **多个 Forgejo 实例** -- 每个 `[[instances]]` 条目都有独立的 Runner 身份 (分别向其自己的 Forgejo 注册) 和独立的任务 poller. 每个任务都带有所属实例 name; 注册令牌校验, 心跳, 以及 `UpdateTask`/`UpdateLog` 转发都通过所属实例的北向客户端路由. 南向保持为单一共享端点 (`listen_addr`/`public_url` 是全局配置): 每个 `workflow_dispatch` 携带的一次性注册令牌将连入的内部 runner 映射回其任务, 从而映射回所属实例. `max_parallel_tasks` 是所有实例 poller 共享的全局并发预算.
 
-**持久的 Runner 身份** -- 首次 `Register` 成功后, Forgery 将 runner UUID 和永久令牌保存到 state 文件. 重启后复用同一身份, 而不会注册一个全新的孤儿 runner; 若 Forgejo 拒绝永久令牌 (被吊销或轮换), Forgery 会自动重新注册并重试.
+**持久的 Runner 身份** -- 首次 `Register` 成功后, Forgery 将 runner UUID 和永久令牌保存到 state 文件. 重启后复用同一身份, 而不会注册一个全新的孤儿 runner; 若 Forgejo 拒绝永久令牌 (被吊销或轮换), Forgery 会自动重新注册并重试. 重新注册会创建**新的** runner 身份 -- 旧身份已失效, Forgejo runner 列表中会出现新条目. 旧身份的在途任务无法恢复: Forgejo 会在大约 10-15 分钟内自动将其标记为失败 (其 zombie 清理定时任务). 若注册令牌本身无效 (在 Forgejo UI 中被重置或配置错误), Forgery 会在尝试之间退避 (指数, 30s 起, 上限 5min) 并记录指向 `forgejo_runner_token` 或 Forgejo UI 的错误日志.
 
 ## 构建与测试
 

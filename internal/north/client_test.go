@@ -152,6 +152,11 @@ func TestNew_RestoresIdentity(t *testing.T) {
 	if got := c.Identity(); got != (state.Identity{UUID: "uuid-1", Token: "token-1"}) {
 		t.Errorf("Identity() = %+v, want restored identity", got)
 	}
+	// A restored identity counts as generation 1 so concurrent RPCs share
+	// one dedupe baseline.
+	if gen := c.generation.Load(); gen != 1 {
+		t.Errorf("generation = %d, want 1 for restored identity", gen)
+	}
 }
 
 // TestNew_LoggerCarriesInstance verifies the multi-instance log contract:
@@ -366,6 +371,10 @@ func TestStartupFlow_RegistersAndPersists(t *testing.T) {
 	}
 	if got := registerToken.Load(); got != "reg-token" {
 		t.Errorf("Register authenticated with %v, want registration token reg-token", got)
+	}
+	// The startup registration issues generation 1.
+	if gen := c.generation.Load(); gen != 1 {
+		t.Errorf("generation = %d, want 1 after startup Register", gen)
 	}
 
 	ids := c.identities.(*fakeIdentities)
@@ -701,6 +710,292 @@ func TestAuthFallback_PollLoopFetchTask(t *testing.T) {
 	}
 	if got := fetchCalls.Load(); got != 2 {
 		t.Errorf("FetchTask called %d times, want 2", got)
+	}
+}
+
+// ── TestAuthFallback hardening (generation dedupe, Register backoff) ────────
+
+// expireBackoff forces the Register backoff to look expired, simulating the
+// passage of the wait period, while keeping the stored wait value so the
+// exponential ramp continues.
+func expireBackoff(c *client) {
+	c.backoffMu.Lock()
+	c.backoffNext = time.Now().Add(-time.Second)
+	c.backoffMu.Unlock()
+}
+
+// TestAuthFallback_ConcurrentDedupe verifies the generation dedupe: two
+// concurrent RPCs that both fail authentication against the old identity
+// trigger exactly one Register — the loser of the regMu race skips Register
+// (the generation changed under it) and retries with the fresh identity. At
+// most one new runner row is created per identity loss.
+func TestAuthFallback_ConcurrentDedupe(t *testing.T) {
+	var registerCalls atomic.Int32
+	var oldMu sync.Mutex
+	var oldCalls int
+	oldGate := make(chan struct{}) // rendezvous: both old-token RPCs in flight
+
+	h := &mockHandler{
+		registerFn: func(_ context.Context, _ *connect.Request[v1.RegisterRequest]) (*connect.Response[v1.RegisterResponse], error) {
+			registerCalls.Add(1)
+			return connect.NewResponse(&v1.RegisterResponse{Runner: &v1.Runner{Uuid: "uuid-new", Token: "token-new"}}), nil
+		},
+		updateTaskFn: func(_ context.Context, req *connect.Request[v1.UpdateTaskRequest]) (*connect.Response[v1.UpdateTaskResponse], error) {
+			// RPCs issued under the revoked identity fail together; RPCs
+			// under the fresh identity succeed.
+			if req.Header().Get("x-runner-token") != "token-1" {
+				return connect.NewResponse(&v1.UpdateTaskResponse{}), nil
+			}
+			oldMu.Lock()
+			oldCalls++
+			if oldCalls == 2 {
+				close(oldGate)
+			}
+			oldMu.Unlock()
+			<-oldGate
+			return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("token revoked"))
+		},
+	}
+
+	ts := startMockServer(t, h)
+	defer ts.Close()
+
+	ids := newFakeIdentities()
+	ids.data[ts.URL] = state.Identity{UUID: "uuid-1", Token: "token-1"}
+	c := newMockClient(t, ts, ids)
+
+	const n = 2
+	errCh := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.ForwardUpdateTask(context.Background(), &v1.UpdateTaskRequest{})
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Errorf("ForwardUpdateTask returned error after concurrent re-register: %v", err)
+		}
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Errorf("Register called %d times, want exactly 1 for two concurrent auth failures", got)
+	}
+	if c.Identity() != (state.Identity{UUID: "uuid-new", Token: "token-new"}) {
+		t.Errorf("identity = %+v, want the re-registered identity", c.Identity())
+	}
+}
+
+// TestAuthFallback_RegisterBackoff verifies the failure backoff: while
+// Register keeps failing, a second auth failure inside the backoff window is
+// not followed by another Register — the original auth error is returned
+// unchanged — and each consecutive failure doubles the wait (exponential
+// ramp).
+func TestAuthFallback_RegisterBackoff(t *testing.T) {
+	var registerCalls atomic.Int32
+	var failRegister atomic.Bool
+	failRegister.Store(true)
+
+	h := &mockHandler{
+		registerFn: func(_ context.Context, _ *connect.Request[v1.RegisterRequest]) (*connect.Response[v1.RegisterResponse], error) {
+			registerCalls.Add(1)
+			if failRegister.Load() {
+				return nil, connect.NewError(connect.CodeUnavailable, errors.New("forgejo down"))
+			}
+			return connect.NewResponse(&v1.RegisterResponse{Runner: &v1.Runner{Uuid: "uuid-new", Token: "token-new"}}), nil
+		},
+		declareFn: func(_ context.Context, _ *connect.Request[v1.DeclareRequest]) (*connect.Response[v1.DeclareResponse], error) {
+			return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("token revoked"))
+		},
+	}
+
+	ts := startMockServer(t, h)
+	defer ts.Close()
+
+	ids := newFakeIdentities()
+	ids.data[ts.URL] = state.Identity{UUID: "uuid-1", Token: "token-1"}
+	c := newMockClient(t, ts, ids)
+
+	// First auth failure: Register attempted, fails → backoff armed at base.
+	err1 := c.Declare(context.Background())
+	if connect.CodeOf(err1) != connect.CodeUnauthenticated {
+		t.Fatalf("first Declare error code = %v, want Unauthenticated", connect.CodeOf(err1))
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Fatalf("Register called %d times, want 1", got)
+	}
+	if c.backoffWait != registerBackoffBase {
+		t.Errorf("backoff wait = %v, want base %v", c.backoffWait, registerBackoffBase)
+	}
+
+	// Second auth failure inside the backoff window: no Register, the
+	// original auth error is returned unchanged.
+	err2 := c.Declare(context.Background())
+	if got := registerCalls.Load(); got != 1 {
+		t.Errorf("Register called %d times during backoff, want still 1", got)
+	}
+	if connect.CodeOf(err2) != connect.CodeUnauthenticated {
+		t.Errorf("second Declare error code = %v, want Unauthenticated", connect.CodeOf(err2))
+	}
+	if err2.Error() != err1.Error() {
+		t.Errorf("second Declare error = %q, want the original error %q unchanged", err2, err1)
+	}
+
+	// Backoff expires, Register fails again → the wait doubles (ramp).
+	expireBackoff(c)
+	err3 := c.Declare(context.Background())
+	if connect.CodeOf(err3) != connect.CodeUnauthenticated {
+		t.Fatalf("third Declare error code = %v, want Unauthenticated", connect.CodeOf(err3))
+	}
+	if got := registerCalls.Load(); got != 2 {
+		t.Errorf("Register called %d times, want 2 after backoff expiry", got)
+	}
+	if c.backoffWait != 2*registerBackoffBase {
+		t.Errorf("backoff wait = %v, want doubled %v", c.backoffWait, 2*registerBackoffBase)
+	}
+	if c.backoffRemaining() <= 0 {
+		t.Error("backoffRemaining() <= 0, want active backoff after failed Register")
+	}
+}
+
+// TestAuthFallback_BackoffResetOnSuccess verifies a successful Register
+// clears the backoff: the next auth failure triggers an immediate Register
+// attempt instead of waiting out a stale backoff.
+func TestAuthFallback_BackoffResetOnSuccess(t *testing.T) {
+	var registerCalls atomic.Int32
+	var registerFailures atomic.Int32
+
+	h := &mockHandler{
+		registerFn: func(_ context.Context, _ *connect.Request[v1.RegisterRequest]) (*connect.Response[v1.RegisterResponse], error) {
+			registerCalls.Add(1)
+			// Fail exactly once, then succeed.
+			if registerFailures.Add(1) == 1 {
+				return nil, connect.NewError(connect.CodeUnavailable, errors.New("forgejo down"))
+			}
+			return connect.NewResponse(&v1.RegisterResponse{Runner: &v1.Runner{Uuid: "uuid-new", Token: "token-new"}}), nil
+		},
+		declareFn: func(_ context.Context, _ *connect.Request[v1.DeclareRequest]) (*connect.Response[v1.DeclareResponse], error) {
+			return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("token revoked"))
+		},
+	}
+
+	ts := startMockServer(t, h)
+	defer ts.Close()
+
+	ids := newFakeIdentities()
+	ids.data[ts.URL] = state.Identity{UUID: "uuid-1", Token: "token-1"}
+	c := newMockClient(t, ts, ids)
+
+	// First auth failure: Register attempted, fails → backoff armed.
+	if err := c.Declare(context.Background()); err == nil {
+		t.Fatal("first Declare returned nil error, want auth error")
+	}
+	if c.backoffRemaining() <= 0 {
+		t.Fatal("backoff not armed after failed Register")
+	}
+
+	// Let the backoff expire; Register succeeds this time and must clear
+	// the backoff state.
+	expireBackoff(c)
+	if err := c.Declare(context.Background()); err == nil {
+		t.Fatal("second Declare returned nil error, want auth error (retry still rejected)")
+	}
+	if got := registerCalls.Load(); got != 2 {
+		t.Fatalf("Register called %d times, want 2 after backoff expiry", got)
+	}
+	c.backoffMu.Lock()
+	backoffNext := c.backoffNext
+	backoffWait := c.backoffWait
+	c.backoffMu.Unlock()
+	if !backoffNext.IsZero() || backoffWait != 0 {
+		t.Errorf("backoff not reset after successful Register: next=%v wait=%v", backoffNext, backoffWait)
+	}
+
+	// Third auth failure: no backoff left, so Register is attempted
+	// immediately instead of being gated.
+	if err := c.Declare(context.Background()); err == nil {
+		t.Fatal("third Declare returned nil error, want auth error")
+	}
+	if got := registerCalls.Load(); got != 3 {
+		t.Errorf("Register called %d times, want 3 (immediate attempt after reset)", got)
+	}
+}
+
+// TestAuthFallback_RegistrationTokenConfigError verifies the deterministic
+// configuration-error path: Register failing with InvalidArgument and a
+// message mentioning the registration token is logged at ERROR level with
+// remediation hints and jumps straight to the maximum backoff, so subsequent
+// auth failures do not re-attempt Register for registerBackoffMax.
+func TestAuthFallback_RegistrationTokenConfigError(t *testing.T) {
+	var registerCalls atomic.Int32
+
+	h := &mockHandler{
+		registerFn: func(_ context.Context, _ *connect.Request[v1.RegisterRequest]) (*connect.Response[v1.RegisterResponse], error) {
+			registerCalls.Add(1)
+			return nil, connect.NewError(connect.CodeInvalidArgument,
+				errors.New("runner registration token not found"))
+		},
+		declareFn: func(_ context.Context, _ *connect.Request[v1.DeclareRequest]) (*connect.Response[v1.DeclareResponse], error) {
+			return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("token revoked"))
+		},
+	}
+
+	ts := startMockServer(t, h)
+	defer ts.Close()
+
+	ids := newFakeIdentities()
+	ids.data[ts.URL] = state.Identity{UUID: "uuid-1", Token: "token-1"}
+
+	// Capture the client's own log output to assert the ERROR log line.
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, nil))
+	inst := testInstance(ts.URL)
+	inst.TLSInsecureSkipVerify = true
+	c, err := New(inst, store.NewMemStore(), ids, log)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	if err := c.Declare(context.Background()); err == nil {
+		t.Fatal("Declare returned nil error, want auth error")
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Fatalf("Register called %d times, want 1", got)
+	}
+	c.backoffMu.Lock()
+	backoffWait := c.backoffWait
+	backoffNext := c.backoffNext
+	c.backoffMu.Unlock()
+	if backoffWait != registerBackoffMax {
+		t.Errorf("backoff wait = %v, want max %v for config error", backoffWait, registerBackoffMax)
+	}
+	if time.Until(backoffNext) <= 0 {
+		t.Error("backoff not armed for config error")
+	}
+
+	// Inside the (maximum) backoff window, no further Register.
+	if err := c.Declare(context.Background()); err == nil {
+		t.Fatal("second Declare returned nil error, want auth error")
+	}
+	if got := registerCalls.Load(); got != 1 {
+		t.Errorf("Register called %d times during config-error backoff, want still 1", got)
+	}
+
+	out := buf.String()
+	for _, want := range []string{
+		`"level":"ERROR"`,
+		"registration token",
+		"forgejo_runner_token",
+		"Forgejo UI",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output missing %q:\n%s", want, out)
+		}
 	}
 }
 

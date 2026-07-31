@@ -110,7 +110,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		// Defensive: no session can exist for an unresolvable instance
 		// (Register fails before creating one), but removing is idempotent
 		// and keeps the invariant that this exit path leaves no session.
-		r.sessions.Remove(taskCtx.SessionToken)
+		r.sessions.Remove(taskCtx.SessionToken())
 		r.pool.Release()
 		return
 	}
@@ -125,7 +125,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		// Drop any session bound to this task (normally none yet — the
 		// runner cannot register before dispatch succeeds — but a race
 		// with one-job auto-registration makes this possible).
-		r.sessions.Remove(taskCtx.SessionToken)
+		r.sessions.Remove(taskCtx.SessionToken())
 
 		// Release backpressure slot.
 		r.pool.Release()
@@ -192,7 +192,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		// timeout fired). Without this, the session and its Running task
 		// would leak: store.GC only reaps Pending/Terminal tasks. The app
 		// GC loop's Expire pass is the backstop for any session this misses.
-		r.sessions.Remove(taskCtx.SessionToken)
+		r.sessions.Remove(taskCtx.SessionToken())
 
 		// Clean up.
 		r.pool.Release()
@@ -232,7 +232,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		default:
 			r.log.Warn("task handling interrupted by shutdown (runner never registered, cleaning up)", "task_id", taskCtx.ID)
 			hbCancel()
-			r.sessions.Remove(taskCtx.SessionToken)
+			r.sessions.Remove(taskCtx.SessionToken())
 			r.store.Remove(taskCtx.ID)
 			r.pool.Release()
 			return

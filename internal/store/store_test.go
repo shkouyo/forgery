@@ -486,6 +486,36 @@ func TestTaskCtxConcurrentStatusAccess(t *testing.T) {
 	wg.Wait()
 }
 
+// TestTaskCtxConcurrentSessionTokenAccess verifies concurrent SetSessionToken
+// / SessionToken access is race-free. This is the one-job auto-registration
+// pattern: the session manager writes the token while run.HandleTask reads
+// it (via the getter) to drop the session on failure/timeout paths. Must be
+// run under -race.
+func TestTaskCtxConcurrentSessionTokenAccess(t *testing.T) {
+	tc := newTestTask(1, "t")
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader goroutine.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			_ = tc.SessionToken()
+		}
+	}()
+
+	// Writer goroutine.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			tc.SetSessionToken(fmt.Sprintf("sess-%d", i%3))
+		}
+	}()
+
+	wg.Wait()
+}
+
 func TestTaskCtxMarkMethods(t *testing.T) {
 	tc := newTestTask(1, "tok")
 	if tc.Status() != StatusPending {
@@ -509,8 +539,8 @@ func TestTaskCtxMarkMethods(t *testing.T) {
 	}
 
 	tc.SetSessionToken("sess-123")
-	if tc.SessionToken != "sess-123" {
-		t.Fatalf("SetSessionToken failed, got %q", tc.SessionToken)
+	if tc.SessionToken() != "sess-123" {
+		t.Fatalf("SetSessionToken failed, got %q", tc.SessionToken())
 	}
 }
 

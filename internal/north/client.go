@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "code.gitea.io/actions-proto-go/runner/v1"
@@ -37,6 +38,19 @@ import (
 // defaultHeartbeatInterval is the heartbeat tick used when an instance has
 // no heartbeat_interval configured; it mirrors the config package default.
 const defaultHeartbeatInterval = 30 * time.Second
+
+// Register failure backoff bounds. After a failed re-registration, further
+// Register attempts are gated behind an exponentially growing delay — each
+// consecutive failure doubles the wait — so a dead registration token cannot
+// hammer Forgejo with one attempt per poll cycle (default 3s) and spam the
+// logs. A successful Register resets the backoff. Deterministic configuration
+// errors (the registration token was reset in Forgejo or is wrong in the
+// config) jump straight to the maximum wait: no retry cadence can fix them
+// until an operator intervenes.
+const (
+	registerBackoffBase = 30 * time.Second
+	registerBackoffMax  = 5 * time.Minute
+)
 
 // Client is the northbound forwarding surface shared by the south and run
 // modules. It is implemented by the concrete *client returned from New.
@@ -82,6 +96,27 @@ type client struct {
 
 	idMu  sync.Mutex // guards runnerUUID/runnerToken
 	regMu sync.Mutex // serializes re-registration in retryOnAuth
+
+	// generation counts how many times a runner identity has been issued
+	// by Register — startup registration and re-registrations alike; an
+	// identity restored from the state file counts as generation 1.
+	// retryOnAuth uses it to deduplicate re-registration across
+	// concurrent RPCs: an RPC records the generation it was issued under
+	// and, on auth failure, re-checks it under regMu. If it changed,
+	// another goroutine already re-registered successfully, so this RPC
+	// skips Register (which would create yet another runner row) and
+	// simply retries with the fresh identity. It is written by Register
+	// under regMu (re-registration) or before any goroutine starts
+	// (startup) and read concurrently by every RPC, hence the atomic.
+	generation atomic.Uint64
+
+	// Backoff state for failed Register attempts (see registerBackoff*
+	// constants). backoffMu is a leaf lock: it may be acquired while
+	// holding regMu (noteRegisterFailure/resetBackoff run under regMu)
+	// but never the other way around, so no lock-order cycle is possible.
+	backoffMu   sync.Mutex
+	backoffNext time.Time     // zero = no backoff active (last Register succeeded or none attempted)
+	backoffWait time.Duration // current backoff value; doubles on each consecutive failure
 }
 
 // Compile-time assertion: the concrete client implements the exported
@@ -142,6 +177,9 @@ func New(inst config.Instance, taskStore store.TaskStore, identities state.Store
 		return nil, fmt.Errorf("north: load identity: %w", err)
 	} else if ok {
 		c.setIdentity(id.UUID, id.Token)
+		// A restored identity is an issued identity: count it as
+		// generation 1 so all concurrent RPCs share one baseline.
+		c.generation.Store(1)
 		c.log.Info("runner identity restored", "forgejo_url", inst.ForgejoURL)
 	}
 
@@ -210,6 +248,10 @@ func stripContainerMapping(labels []string) []string {
 // saved to the identity store and used as the x-runner-uuid / x-runner-token
 // headers of all subsequent requests. Register never triggers the
 // auth-fallback re-registration — it IS the recovery path.
+//
+// Every successful Register issues a new runner identity and therefore
+// advances the identity generation (see client.generation) and resets the
+// failure backoff (see client.backoffNext).
 func (c *client) Register(ctx context.Context) error {
 	req := connect.NewRequest(&v1.RegisterRequest{
 		Token:   c.inst.ForgejoRunnerToken,
@@ -231,6 +273,13 @@ func (c *client) Register(ctx context.Context) error {
 	if err := c.identities.Save(c.inst.ForgejoURL, state.Identity{UUID: runner.GetUuid(), Token: runner.GetToken()}); err != nil {
 		return fmt.Errorf("register: persist identity: %w", err)
 	}
+	// A new identity generation is now active: concurrent RPCs that saw
+	// auth failures against the previous generation skip re-registration
+	// and just retry with this identity (see retryOnAuth).
+	c.generation.Add(1)
+	// Success clears the failure backoff: the next Register, if ever
+	// needed, starts from the base delay again.
+	c.resetBackoff()
 	c.log.Info("runner registered", "runner_uuid", runner.GetUuid())
 	return nil
 }
@@ -365,25 +414,72 @@ func (c *client) currentIdentity() (uuid, token string) {
 // retryOnAuth runs fn once and, if it fails with an authentication or
 // permission error, re-registers the runner once and retries fn a single
 // time. This recovers from a revoked or rotated runner token without a
-// daemon restart. Re-registration is serialized so concurrent RPC failures
-// (poller, heartbeats, forwards) trigger at most one Register at a time.
+// daemon restart.
 //
-// If the re-registration itself fails, or the retry fails again, the error
-// is returned unchanged in spirit — callers log it and retry on the next
-// poll cycle.
+// The recovery path is hardened against concurrent and repeated failures:
+//
+//   - Deduplication: the identity generation is recorded when the RPC is
+//     issued and re-checked under regMu. If another concurrent RPC already
+//     re-registered (generation changed), Register is skipped — it would
+//     create a second new runner row for the same token failure — and fn is
+//     retried directly with the fresh identity. At most one new runner row
+//     is created per identity loss.
+//   - Backoff: when Register itself keeps failing, attempts are gated by an
+//     exponential backoff (registerBackoffBase → registerBackoffMax). While
+//     backing off, fn is not retried — the old identity is rejected, so the
+//     retry would fail too — and the original auth error is returned
+//     unchanged; callers retry on their own schedule (poll cycle, heartbeat
+//     tick). A successful Register resets the backoff.
+//   - Deterministic configuration errors: an InvalidArgument Register error
+//     whose message mentions the registration token means the token was
+//     reset in Forgejo or is wrong in the config. It is logged at ERROR
+//     level with remediation hints and jumps straight to the maximum
+//     backoff instead of ramping up exponentially.
+//
+// Register itself never goes through this path — it IS the recovery path.
 func (c *client) retryOnAuth(ctx context.Context, fn func(context.Context) error) error {
+	// Record the identity generation this RPC was issued under. If it
+	// changes while the RPC is in flight, another goroutine has already
+	// re-registered, so this call must not Register again.
+	gen := c.generation.Load()
+
 	err := fn(ctx)
 	if err == nil || !isAuthError(err) {
 		return err
 	}
 
-	c.log.Warn("RPC rejected by Forgejo, re-registering runner", "err", err)
 	c.regMu.Lock()
-	regErr := c.Register(ctx)
-	c.regMu.Unlock()
-	if regErr != nil {
-		return fmt.Errorf("re-register after auth failure (%v): %w", err, regErr)
+
+	// Concurrent re-registration already produced a fresh identity:
+	// skip Register (one new runner row per identity loss) and retry fn
+	// with the new identity.
+	if c.generation.Load() != gen {
+		c.regMu.Unlock()
+		c.log.Info("runner identity refreshed by concurrent RPC, retrying", "err", err)
+		return fn(ctx)
 	}
+
+	// Register is in backoff after a recent failure: do not hammer
+	// Forgejo — the old identity would be rejected again anyway. Return
+	// the original auth error without retrying fn.
+	if wait := c.backoffRemaining(); wait > 0 {
+		c.regMu.Unlock()
+		c.log.Warn("skipping runner re-registration, Register is backing off",
+			"retry_in", wait.Round(time.Second), "err", err)
+		return err
+	}
+
+	c.log.Warn("RPC rejected by Forgejo, re-registering runner", "err", err)
+	regErr := c.Register(ctx)
+	if regErr != nil {
+		c.noteRegisterFailure(regErr)
+		c.regMu.Unlock()
+		// The register failure is logged with its backoff schedule;
+		// return the original auth error so callers see the RPC-level
+		// failure and retry on their own schedule.
+		return err
+	}
+	c.regMu.Unlock()
 	c.log.Info("runner re-registered after auth failure")
 	return fn(ctx)
 }
@@ -401,4 +497,87 @@ func isAuthError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// ── Register failure backoff ──
+
+// registrationTokenErrorSubstr is the message fragment Forgejo includes in
+// the Register error when the registration token is unknown or has been
+// invalidated (e.g. "runner registration token not found" / "...has been
+// invalidated, please use the latest one"). Together with the
+// InvalidArgument code it identifies a deterministic configuration problem
+// rather than a transient failure.
+const registrationTokenErrorSubstr = "registration token"
+
+// isRegistrationTokenError reports whether err is the deterministic
+// configuration error Forgejo returns for an unknown or invalidated
+// registration token. Error code and message are read the same way as
+// everywhere else in this package: connect.CodeOf plus the string form of
+// the error.
+func isRegistrationTokenError(err error) bool {
+	return connect.CodeOf(err) == connect.CodeInvalidArgument &&
+		strings.Contains(err.Error(), registrationTokenErrorSubstr)
+}
+
+// backoffRemaining returns how long Register must stay quiet, or 0 when
+// re-registration is allowed. Thread-safe (backoffMu is a leaf lock).
+func (c *client) backoffRemaining() time.Duration {
+	c.backoffMu.Lock()
+	defer c.backoffMu.Unlock()
+	if c.backoffNext.IsZero() {
+		return 0
+	}
+	if wait := time.Until(c.backoffNext); wait > 0 {
+		return wait
+	}
+	return 0
+}
+
+// noteRegisterFailure records a failed Register attempt and arms the
+// backoff. Deterministic configuration errors (invalid registration token)
+// jump straight to registerBackoffMax — no retry cadence helps until the
+// operator fixes the token — while transient failures double the previous
+// wait (registerBackoffBase first, capped at registerBackoffMax). Called
+// under regMu; takes backoffMu (leaf).
+func (c *client) noteRegisterFailure(regErr error) {
+	if isRegistrationTokenError(regErr) {
+		c.setBackoff(registerBackoffMax)
+		c.log.Error("runner re-registration failed: registration token invalid",
+			"err", regErr,
+			"hint", "check forgejo_runner_token in the config, or reset the registration token in the Forgejo UI",
+			"retry_in", registerBackoffMax.Round(time.Second))
+		return
+	}
+	c.backoffMu.Lock()
+	wait := c.backoffWait
+	c.backoffMu.Unlock()
+	if wait == 0 {
+		wait = registerBackoffBase
+	} else {
+		wait *= 2
+		if wait > registerBackoffMax {
+			wait = registerBackoffMax
+		}
+	}
+	c.setBackoff(wait)
+	c.log.Warn("runner re-registration failed, backing off",
+		"err", regErr, "retry_in", wait.Round(time.Second))
+}
+
+// setBackoff arms the backoff so the next Register attempt is at least wait
+// away, and stores wait as the current backoff value for the exponential
+// ramp.
+func (c *client) setBackoff(wait time.Duration) {
+	c.backoffMu.Lock()
+	c.backoffWait = wait
+	c.backoffNext = time.Now().Add(wait)
+	c.backoffMu.Unlock()
+}
+
+// resetBackoff clears the backoff state after a successful Register.
+func (c *client) resetBackoff() {
+	c.backoffMu.Lock()
+	c.backoffWait = 0
+	c.backoffNext = time.Time{}
+	c.backoffMu.Unlock()
 }

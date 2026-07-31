@@ -48,7 +48,7 @@ type TaskCtx struct {
 	// Mutable fields — protected by mu.
 	mu                 sync.RWMutex
 	status             TaskStatus
-	SessionToken       string        // Session token assigned after successful Register
+	sessionToken       string        // Session token assigned after successful Register
 	DispatchedAt       time.Time     // When workflow_dispatch succeeded
 	RunnerRegisteredAt time.Time     // When the internal runner completed Register
 	done               chan struct{} // closed when task reaches terminal state
@@ -74,7 +74,16 @@ func (t *TaskCtx) SetStatus(s TaskStatus) {
 func (t *TaskCtx) SetSessionToken(token string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.SessionToken = token
+	t.sessionToken = token
+}
+
+// SessionToken returns the session token assigned during Register under a
+// read lock. It is the read counterpart of SetSessionToken: the field is
+// unexported so every access goes through one of the two locked accessors.
+func (t *TaskCtx) SessionToken() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.sessionToken
 }
 
 // MarkDispatched transitions the task to StatusDispatched and records the
