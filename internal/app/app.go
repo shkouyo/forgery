@@ -239,19 +239,20 @@ func maxGAStartupTimeout(cfg *config.Config) time.Duration {
 	return max
 }
 
-// sessionMaxAge returns how old a runner session may become before the GC
-// loop expires it.
+// sessionMaxAge returns how old a runner session's last activity may be
+// before the GC loop expires it.
 //
 // Semantics: a session is the runtime credential of a task. In the healthy
 // flow the session's lifetime is bounded by the task's own: south removes it
 // when the runner reports a terminal UpdateTask, and run.HandleTask removes
-// it in the GA_STARTUP_TIMEOUT branch at most max(GAStartupTimeout) after
-// dispatch — a session cannot exist before its task is dispatched, so a
-// healthy session never reaches maxAge. The ×2 factor absorbs the GC tick
+// it in the GA_STARTUP_TIMEOUT branch. Expiry is judged against
+// LastActivity, which every authenticated RPC refreshes via sessions.Touch:
+// an active runner's session is continuously renewed and never reaches
+// maxAge, no matter how long the task runs. The ×2 factor absorbs the GC tick
 // period and cleanup races (e.g. a one-job auto-registration landing a
 // moment after HandleTask already removed the task), guaranteeing Expire
 // only ever fires on genuinely orphaned sessions: a runner that registered
-// and died without a terminal UpdateTask, or a HandleTask that exited
+// and went silent without a terminal UpdateTask, or a HandleTask that exited
 // without cleaning up.
 func sessionMaxAge(cfg *config.Config) time.Duration {
 	return 2 * maxGAStartupTimeout(cfg)
@@ -259,9 +260,11 @@ func sessionMaxAge(cfg *config.Config) time.Duration {
 
 // gcOnce performs one garbage-collection pass: (a) store.GC reaps expired
 // Pending tasks and Terminal tasks past their retention; (b) Expire drops
-// orphaned sessions older than maxAge, and for each of them signals the
-// task terminal (MarkDone releases the backpressure slot if HandleTask is
-// still waiting on it) and removes the task from the store.
+// sessions whose last activity is older than maxAge — i.e. runners that
+// registered but went silent — and for each of them signals the task
+// terminal (MarkDone releases the backpressure slot if HandleTask is still
+// waiting on it) and removes the task from the store. Active sessions never
+// reach maxAge because every authenticated RPC refreshes LastActivity.
 func gcOnce(now time.Time, st store.TaskStore, sessions *session.Manager, maxAge time.Duration, log *slog.Logger) {
 	// (a) Store GC: expired Pending / retained Terminal tasks.
 	st.GC(now)

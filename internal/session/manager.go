@@ -3,8 +3,8 @@
 // receives a session token, and all subsequent RPCs (Declare, FetchTask,
 // UpdateTask, UpdateLog) are authenticated via that session token.
 //
-// The Manager provides concurrency-safe Create, Lookup, Update, Remove, and
-// Expire operations backed by a map protected with sync.RWMutex.
+// The Manager provides concurrency-safe Create, Lookup, Touch, Update,
+// Remove, and Expire operations backed by a map protected with sync.RWMutex.
 package session
 
 import (
@@ -24,14 +24,22 @@ const sessionTokenBytes = 16
 // session token to the task context that the runner is authorized to access,
 // along with metadata declared by the runner during registration.
 //
-// CreatedAt is set once at creation and never modified afterwards. It anchors
-// the Expire deadline that reaps orphaned sessions (see Manager.Expire).
+// CreatedAt is set once at creation and never modified afterwards; it is kept
+// for diagnostics. LastActivity anchors the Expire deadline that reaps
+// orphaned sessions (see Manager.Expire): it is initialized at creation and
+// refreshed by Manager.Touch on every authenticated RPC, so an active
+// runner's session is continuously renewed.
+//
+// Neither timestamp is guarded by the manager mutex once the session is
+// handed out; Touch refreshes LastActivity under the manager lock, and Expire
+// reads it under the same lock, so the two never race.
 type Session struct {
 	SessionToken string
 	TaskCtx      *store.TaskCtx
 	RunnerName   string
 	Labels       []string
-	CreatedAt    time.Time
+	CreatedAt    time.Time // fixed at creation, diagnostics only
+	LastActivity time.Time // refreshed by Touch on every authenticated RPC
 }
 
 // Manager is a concurrency-safe registry of active sessions, keyed by session
@@ -74,12 +82,14 @@ func (m *Manager) Create(taskCtx *store.TaskCtx, runnerName string, labels []str
 // token is reused as the session token so subsequent RPCs with the same token
 // are recognized.
 func (m *Manager) CreateWithToken(taskCtx *store.TaskCtx, sessionToken string, runnerName string, labels []string) *Session {
+	now := time.Now()
 	session := &Session{
 		SessionToken: sessionToken,
 		TaskCtx:      taskCtx,
 		RunnerName:   runnerName,
 		Labels:       labels,
-		CreatedAt:    time.Now(),
+		CreatedAt:    now,
+		LastActivity: now,
 	}
 
 	m.mu.Lock()
@@ -98,6 +108,23 @@ func (m *Manager) Lookup(sessionToken string) (*Session, bool) {
 	session, ok := m.sessions[sessionToken]
 	m.mu.RUnlock()
 	return session, ok
+}
+
+// Touch refreshes the LastActivity timestamp of the session identified by
+// sessionToken, extending the deadline after which Expire reaps it. It
+// returns false when no session matches the token. The south handler calls
+// Touch on every authenticated RPC, so a runner that keeps talking to the
+// proxy never has its session expired, while a runner that registered and
+// then went silent is still reaped once LastActivity ages past maxAge.
+func (m *Manager) Touch(sessionToken string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionToken]
+	if !ok {
+		return false
+	}
+	s.LastActivity = time.Now()
+	return true
 }
 
 // Update updates the runner name and labels for an existing session.
@@ -120,9 +147,10 @@ func (m *Manager) Remove(sessionToken string) {
 	m.mu.Unlock()
 }
 
-// Expire deletes and returns every session whose age exceeds maxAge, i.e.
-// every session with now.Sub(CreatedAt) > maxAge. A session that is exactly
-// maxAge old is not expired. The order of the returned slice is unspecified.
+// Expire deletes and returns every session whose last activity is older than
+// maxAge, i.e. every session with now.Sub(LastActivity) > maxAge. A session
+// whose last activity is exactly maxAge old is not expired. The order of the
+// returned slice is unspecified.
 //
 // A session is the runtime credential of a task: its normal lifecycle is
 // bounded by the task itself and terminated explicitly — south removes the
@@ -130,15 +158,18 @@ func (m *Manager) Remove(sessionToken string) {
 // and GA_STARTUP_TIMEOUT branches. Expire is the fallback for orphaned
 // sessions: a runner that registered and then died without ever reporting a
 // terminal state (or a HandleTask that exited without cleaning up) would
-// otherwise leak the session and its Running task forever. Expire is
-// idempotent in effect — sessions already removed are simply not returned.
+// otherwise leak the session and its Running task forever. Because every
+// authenticated RPC refreshes LastActivity via Touch, Expire only ever fires
+// on sessions whose runner has been silent for longer than maxAge — active
+// long-running tasks are never reaped. Expire is idempotent in effect —
+// sessions already removed are simply not returned.
 func (m *Manager) Expire(now time.Time, maxAge time.Duration) []*Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	var expired []*Session
 	for token, s := range m.sessions {
-		if now.Sub(s.CreatedAt) > maxAge {
+		if now.Sub(s.LastActivity) > maxAge {
 			expired = append(expired, s)
 			delete(m.sessions, token)
 		}

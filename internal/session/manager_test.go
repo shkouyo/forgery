@@ -241,11 +241,11 @@ func TestNewManager_InitializesMap(t *testing.T) {
 
 // ── Expire ──
 
-// backdate sets a session's CreatedAt to force it to a known age.
-// CreatedAt is immutable in production; tests may set it directly before
-// any concurrent access begins.
+// backdate sets a session's LastActivity to force it to a known age.
+// LastActivity is refreshed by Touch in production; tests may set it
+// directly before any concurrent access begins.
 func backdate(s *Session, age time.Duration) {
-	s.CreatedAt = time.Now().Add(-age)
+	s.LastActivity = time.Now().Add(-age)
 }
 
 func TestExpire_RemovesExpired_KeepsFresh(t *testing.T) {
@@ -278,10 +278,11 @@ func TestExpire_Boundary_ExactlyMaxAgeNotExpired(t *testing.T) {
 	m := NewManager()
 	s := m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
 
-	// Exactly maxAge old: strict > comparison must keep it alive.
+	// Exactly maxAge since last activity: strict > comparison must keep it
+	// alive.
 	const maxAge = time.Hour
 	now := time.Now()
-	s.CreatedAt = now.Add(-maxAge)
+	s.LastActivity = now.Add(-maxAge)
 
 	got := m.Expire(now, maxAge)
 	if len(got) != 0 {
@@ -356,9 +357,10 @@ func TestExpire_ZeroMaxAge(t *testing.T) {
 	m := NewManager()
 	s := m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
 
-	// maxAge = 0 expires any session created strictly before now.
+	// maxAge = 0 expires any session whose last activity is strictly before
+	// now.
 	now := time.Now()
-	s.CreatedAt = now.Add(-time.Millisecond)
+	s.LastActivity = now.Add(-time.Millisecond)
 
 	got := m.Expire(now, 0)
 	if len(got) != 1 || got[0] != s {
@@ -414,5 +416,128 @@ func TestExpire_ConcurrentWithCreateAndLookup(t *testing.T) {
 				t.Error("Expire returned a nil session")
 			}
 		}
+	}
+}
+
+// ── Touch ──
+
+// TestTouch_Exists verifies Touch refreshes LastActivity on an existing
+// session and reports true.
+func TestTouch_Exists(t *testing.T) {
+	m := NewManager()
+	s := m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
+
+	// Initial LastActivity is initialized at creation.
+	if s.LastActivity.IsZero() {
+		t.Fatal("LastActivity should be initialized at creation")
+	}
+
+	// Backdate, then Touch must refresh it.
+	s.LastActivity = time.Now().Add(-time.Hour)
+	if !m.Touch(s.SessionToken) {
+		t.Fatal("Touch returned false for an existing session")
+	}
+	if time.Since(s.LastActivity) > time.Minute {
+		t.Errorf("Touch did not refresh LastActivity: %v ago", time.Since(s.LastActivity))
+	}
+
+	// A touched session must survive an Expire pass that would have reaped
+	// it before the touch.
+	if got := m.Expire(time.Now(), 30*time.Minute); len(got) != 0 {
+		t.Fatalf("touched session expired: %+v", got)
+	}
+	if _, ok := m.Lookup(s.SessionToken); !ok {
+		t.Fatal("touched session removed by Expire")
+	}
+}
+
+// TestTouch_Nonexistent verifies Touch reports false for unknown tokens and
+// never panics.
+func TestTouch_Nonexistent(t *testing.T) {
+	m := NewManager()
+	if m.Touch("never-existed") {
+		t.Fatal("Touch returned true for a nonexistent session")
+	}
+	m.Remove("never-existed")
+	if m.Touch("") {
+		t.Fatal("Touch returned true for an empty token")
+	}
+}
+
+// TestTouch_AfterRemove verifies Touch reports false once the session is
+// gone, and does not resurrect it.
+func TestTouch_AfterRemove(t *testing.T) {
+	m := NewManager()
+	s := m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
+	m.Remove(s.SessionToken)
+	if m.Touch(s.SessionToken) {
+		t.Fatal("Touch returned true for a removed session")
+	}
+	if _, ok := m.Lookup(s.SessionToken); ok {
+		t.Fatal("Touch resurrected a removed session")
+	}
+}
+
+// TestTouch_Concurrent runs Touch concurrently with Expire and Remove under
+// -race to verify LastActivity refreshes never race with reaping.
+func TestTouch_Concurrent(t *testing.T) {
+	m := NewManager()
+	s := m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
+
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			if idx%3 == 0 {
+				// Refresh the same session from many goroutines.
+				if !m.Touch(s.SessionToken) && idx%3 == 0 {
+					// The session may be reaped by the Expire worker
+					// below; that is the expected false case.
+				}
+			} else if idx%3 == 1 {
+				m.Expire(time.Now(), time.Nanosecond)
+			} else {
+				m.Lookup(s.SessionToken)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Whatever the outcome (session may have been reaped by the Expire
+	// workers), nothing may have panicked and the manager must still be
+	// usable.
+	_ = m.Expire(time.Now(), time.Hour)
+}
+
+// TestExpire_UsesLastActivityNotCreatedAt pins the expiry semantics: a
+// session created long ago but with recent activity survives, while a
+// freshly created session that has been silent expires. This is the property
+// that keeps long-running tasks alive in production.
+func TestExpire_UsesLastActivityNotCreatedAt(t *testing.T) {
+	m := NewManager()
+	const maxAge = time.Hour
+
+	// Old CreatedAt, recent activity: must survive (a long-running task
+	// whose runner keeps talking to the proxy).
+	longRunning := m.Create(newTaskCtx(1, "reg-1"), "runner-a", nil)
+	longRunning.CreatedAt = time.Now().Add(-3 * time.Hour)
+	longRunning.LastActivity = time.Now().Add(-time.Minute)
+
+	// Fresh CreatedAt, silent for longer than maxAge: must expire (a
+	// runner that registered and then died).
+	orphan := m.Create(newTaskCtx(2, "reg-2"), "runner-b", nil)
+	orphan.LastActivity = time.Now().Add(-2 * time.Hour)
+
+	got := m.Expire(time.Now(), maxAge)
+	if len(got) != 1 || got[0] != orphan {
+		t.Fatalf("Expire = %+v, want only the silent session", got)
+	}
+	if _, ok := m.Lookup(longRunning.SessionToken); !ok {
+		t.Error("long-running session with recent activity was expired")
+	}
+	if _, ok := m.Lookup(orphan.SessionToken); ok {
+		t.Error("silent session survived Expire")
 	}
 }

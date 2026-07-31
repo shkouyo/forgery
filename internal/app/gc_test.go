@@ -29,10 +29,12 @@ func newGCTask(id int64, instance, regToken string, age time.Duration, status st
 	return tc
 }
 
-// newOrphanedSession registers a session for a task and backdates it past maxAge.
+// newOrphanedSession registers a session for a task and backdates its last
+// activity past maxAge (an orphan is a runner that registered and then went
+// silent; Expire judges age by LastActivity, refreshed by Touch).
 func newOrphanedSession(m *session.Manager, taskCtx *store.TaskCtx, age time.Duration) *session.Session {
 	s := m.CreateWithToken(taskCtx, "sess-"+string(rune('a'+taskCtx.ID)), "runner", nil)
-	s.CreatedAt = time.Now().Add(-age)
+	s.LastActivity = time.Now().Add(-age)
 	return s
 }
 
@@ -143,6 +145,36 @@ func TestGCOnce_KeepsFreshSessionAndTask(t *testing.T) {
 	}
 	if _, ok := st.GetByID(9); !ok {
 		t.Error("fresh running task must survive gcOnce")
+	}
+}
+
+// TestGCOnce_KeepsLongRunningTask verifies the F2 guarantee at the pass
+// level: a task that has been running longer than maxAge survives gcOnce as
+// long as its session shows recent activity (the runner keeps calling RPCs,
+// each of which refreshes LastActivity via Touch).
+func TestGCOnce_KeepsLongRunningTask(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+
+	// Task dispatched hours ago, still Running — well past sessionMaxAge.
+	taskCtx := newGCTask(15, "inst-a", "reg-15", 3*time.Hour, store.StatusRunning)
+	st.PutPending(taskCtx)
+	s := m.CreateWithToken(taskCtx, "sess-active", "runner", nil)
+	s.CreatedAt = time.Now().Add(-3 * time.Hour)  // session itself is old
+	s.LastActivity = time.Now().Add(-time.Second) // but the runner is active
+
+	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+
+	if _, ok := m.Lookup(s.SessionToken); !ok {
+		t.Error("active session of a long-running task was expired")
+	}
+	if _, ok := st.GetByID(15); !ok {
+		t.Error("long-running task was removed by gcOnce")
+	}
+	select {
+	case <-taskCtx.Done():
+		t.Error("long-running task was marked done by gcOnce")
+	default:
 	}
 }
 

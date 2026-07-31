@@ -83,8 +83,14 @@ func failureUpdateRequest(taskID int64) *v1.UpdateTaskRequest {
 //  3. On success: mark dispatched, start heartbeat, wait for completion/timeout.
 //  4. On failure: report failure to Forgejo, drop any session, release slot, return.
 //  5. On completion (done signal from internal runner): stop heartbeat, release slot.
-//  6. On GA_STARTUP_TIMEOUT: report failure, stop heartbeat, drop session, release slot, remove from store.
+//  6. On GA_STARTUP_TIMEOUT with no runner registered: report failure, stop
+//     heartbeat, drop session, release slot, remove from store.
 //  7. On context cancellation: graceful stop of heartbeat, release slot.
+//
+// The wait after dispatch has two phases (see Step 4): GAStartupTimeout
+// bounds only the wait for the internal runner to connect. Once the runner
+// has registered, the timeout no longer applies — the task may run as long
+// as it needs.
 func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 	r.log.Info("handling task", "task_id", taskCtx.ID, "instance", taskCtx.Instance)
 
@@ -134,21 +140,41 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 	defer hbCancel()
 	go client.StartHeartbeat(hbCtx, taskCtx)
 
-	// Step 4: Wait for completion, timeout, or global shutdown.
-	// The timeout is the owning instance's GAStartupTimeout.
+	// Step 4: Wait for the internal runner to connect (bounded by
+	// GAStartupTimeout), then for the task to reach a terminal state.
+	//
+	// The wait has two phases:
+	//   Phase 1 (not yet registered): GAStartupTimeout bounds how long we
+	//   wait for the internal runner to connect. If it expires before the
+	//   runner registers, the task is failed — the runner never connected.
+	//   Phase 2 (runner registered): GAStartupTimeout no longer applies. A
+	//   registered runner may execute for as long as the task needs; only a
+	//   terminal state or global shutdown ends the wait. A runner that
+	//   registered and then died without reporting a terminal state is
+	//   reaped by the app GC loop's session expiry, not by HandleTask.
 	timeout := time.After(inst.GAStartupTimeout)
 
+	// Phase 1: waiting for the internal runner to register.
 	select {
 	case <-taskCtx.Done():
-		// The internal runner reached a terminal state. The south handler
-		// has already forwarded the final UpdateTask, cleaned up the session,
-		// and removed the task from the store.
-		r.log.Info("task completed by internal runner", "task_id", taskCtx.ID)
+		// The task reached a terminal state before the runner registered
+		// (defensive: in practice the runner registers before any terminal
+		// UpdateTask, but the GC loop or a cleanup race can close Done
+		// first). The south handler / GC loop has already forwarded the
+		// final UpdateTask, cleaned up the session, and removed the task
+		// from the store.
+		r.log.Info("task completed before runner registration", "task_id", taskCtx.ID)
 		hbCancel()
 		r.pool.Release()
+		return
+
+	case <-taskCtx.Registered():
+		// The internal runner connected. Fall through to phase 2 — the
+		// startup timeout no longer applies.
+		r.log.Info("internal runner connected, waiting for terminal state", "task_id", taskCtx.ID)
 
 	case <-timeout:
-		// GA_STARTUP_TIMEOUT expired — the internal runner never connected.
+		// GA_STARTUP_TIMEOUT expired and the runner never registered.
 		r.log.Warn("task timed out waiting for internal runner", "task_id", taskCtx.ID)
 
 		// Stop the heartbeat.
@@ -157,16 +183,38 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		// Report failure to Forgejo.
 		client.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
 
-		// Drop the runner's session if one was created before the timeout
-		// (the runner registered but never reported a terminal state).
-		// Without this, the session and its Running task would leak:
-		// store.GC only reaps Pending/Terminal tasks. The app GC loop's
-		// Expire pass is the backstop for any session this misses.
+		// Drop the runner's session if one was created in a race with this
+		// branch (a one-job auto-registration landing a moment before the
+		// timeout fired). Without this, the session and its Running task
+		// would leak: store.GC only reaps Pending/Terminal tasks. The app
+		// GC loop's Expire pass is the backstop for any session this misses.
 		r.sessions.Remove(taskCtx.SessionToken)
 
 		// Clean up.
 		r.pool.Release()
 		r.store.Remove(taskCtx.ID)
+		return
+
+	case <-ctx.Done():
+		// Global shutdown (e.g., SIGTERM). Stop the heartbeat but leave
+		// the task in the store — Forgejo will re-assign it when this
+		// runner disconnects.
+		r.log.Warn("task handling interrupted by shutdown", "task_id", taskCtx.ID)
+		hbCancel()
+		r.pool.Release()
+		return
+	}
+
+	// Phase 2: waiting for the terminal state of a registered runner. The
+	// GAStartupTimeout timer from phase 1 fires harmlessly and is released.
+	select {
+	case <-taskCtx.Done():
+		// The internal runner reached a terminal state. The south handler
+		// has already forwarded the final UpdateTask, cleaned up the session,
+		// and removed the task from the store.
+		r.log.Info("task completed by internal runner", "task_id", taskCtx.ID)
+		hbCancel()
+		r.pool.Release()
 
 	case <-ctx.Done():
 		// Global shutdown (e.g., SIGTERM). Stop the heartbeat but leave

@@ -406,6 +406,94 @@ func TestHandleTask_Timeout_DropsSession(t *testing.T) {
 	}
 }
 
+// TestHandleTask_RegisteredSurvivesStartupTimeout verifies the F1 fix: a
+// runner that registers before GAStartupTimeout expires may keep the task
+// running past the timeout point without the task being failed. Only a
+// runner that never connects is failed by the timeout. The task then
+// completes through the normal Done path.
+func TestHandleTask_RegisteredSurvivesStartupTimeout(t *testing.T) {
+	st := store.NewMemStore()
+	disp := &mockDispatcher{}
+	nc := &mockNorthClient{heartbeatDone: make(chan struct{})}
+	sess := &mockSessionRemover{}
+
+	taskCtx := newTaskCtx(13, "inst-a")
+	st.PutPending(taskCtx)
+
+	// Very short startup timeout: 100ms. The runner registers at ~30ms and
+	// the task then runs well past the timeout point.
+	instances := map[string]instanceEntry{
+		"inst-a": entry("inst-a", 100*time.Millisecond, nc),
+	}
+	r, pool := newRunnerWithSessions(instances, disp, st, sess)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Mimic the north poller: acquire the backpressure slot before the task
+	// is handled, so a premature Release by HandleTask is observable.
+	if err := pool.Acquire(ctx); err != nil {
+		t.Fatalf("test setup: acquire slot: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.HandleTask(ctx, taskCtx)
+		close(done)
+	}()
+
+	// Give HandleTask time to dispatch and start the heartbeat, then have
+	// the internal runner register (south's MarkRunnerRegistered).
+	time.Sleep(30 * time.Millisecond)
+	taskCtx.MarkRunnerRegistered()
+
+	// Wait until well past the startup timeout point. The task is still
+	// running: it must NOT have been failed, removed, or released.
+	time.Sleep(200 * time.Millisecond)
+
+	for _, c := range nc.forwardedResults() {
+		if c.Result == v1.Result_RESULT_FAILURE {
+			t.Fatal("task failed after startup timeout despite runner registered")
+		}
+	}
+	if len(sess.removedTokens()) != 0 {
+		t.Fatalf("session removed after startup timeout despite runner registered: %v", sess.removedTokens())
+	}
+	if _, ok := st.GetByID(13); !ok {
+		t.Fatal("task removed from store after startup timeout despite runner registered")
+	}
+	if slotFree(t, pool) {
+		t.Fatal("slot released after startup timeout despite runner registered")
+	}
+	if taskCtx.Status() != store.StatusRunning {
+		t.Fatalf("task status = %v, want StatusRunning", taskCtx.Status())
+	}
+
+	// Now the runner reaches a terminal state: the normal success path must
+	// complete the task.
+	taskCtx.MarkDone()
+
+	select {
+	case <-done:
+		// OK
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleTask did not complete after done signal")
+	}
+
+	// Cleanup on the success path: slot released, no failure forwarded.
+	if !slotFree(t, pool) {
+		t.Fatal("slot not released after done signal")
+	}
+	for _, c := range nc.forwardedResults() {
+		if c.Result == v1.Result_RESULT_FAILURE {
+			t.Error("unexpected failure forward on success path")
+		}
+	}
+	if len(sess.removedTokens()) != 0 {
+		t.Errorf("session removed on success path: %v", sess.removedTokens())
+	}
+}
+
 // TestHandleTask_NoSession_RemoveSafe verifies that the failure/timeout paths
 // tolerate a task with no session (empty token): Remove must be called with
 // the empty string and must not panic.

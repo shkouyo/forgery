@@ -164,6 +164,19 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 	// Try session token first (normal path after explicit Register).
 	sess, ok := h.sessions.Lookup(token)
 	if ok {
+		// Refresh the session's LastActivity so the GC loop's Expire pass
+		// never reaps a session whose runner is actively talking to us:
+		// every authenticated RPC extends the orphan deadline.
+		if !h.sessions.Touch(token) {
+			// The session was removed between Lookup and Touch (e.g. the
+			// terminal UpdateTask path or the GC loop). Treat the request
+			// as unauthenticated.
+			h.log.Warn("session vanished during authentication",
+				"token_prefix", tokenPreview,
+				"token_len", len(token),
+			)
+			return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("invalid session token"))
+		}
 		return sess, nil
 	}
 
@@ -195,8 +208,11 @@ func (h *Handler) authenticate(req connect.AnyRequest) (*session.Session, error)
 
 	// Create a session using the registration token as the session token.
 	// This allows subsequent RPCs (FetchTask, UpdateTask, UpdateLog) which
-	// send the same token to find the session.
+	// send the same token to find the session. The freshly created session
+	// has LastActivity initialized to now; Touch below keeps the contract
+	// that every authenticated RPC refreshes the orphan deadline.
 	sess = h.sessions.CreateWithToken(taskCtx, token, "", nil)
+	h.sessions.Touch(token)
 
 	// Mark the runner as registered.
 	taskCtx.MarkRunnerRegistered()

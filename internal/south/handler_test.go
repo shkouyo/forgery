@@ -1272,6 +1272,118 @@ func TestAuthenticate_OneJobUnknownInstance(t *testing.T) {
 	}
 }
 
+// TestAuthenticate_SessionHit_TouchesSession verifies the F2 fix: every
+// authenticated RPC on the session-token path refreshes the session's
+// LastActivity, so the GC loop never reaps a session whose runner is
+// actively talking to the proxy — even for tasks running far past
+// sessionMaxAge.
+func TestAuthenticate_SessionHit_TouchesSession(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	regToken := "touch-session-token"
+	newTaskCtx(ms, 42, regToken, "inst-a")
+	sessionToken := registerTask(t, h, regToken, 42)
+
+	sess, ok := sm.Lookup(sessionToken)
+	if !ok {
+		t.Fatal("session not found after Register")
+	}
+
+	// Backdate LastActivity past maxAge, then an authenticated RPC must
+	// refresh it.
+	sess.LastActivity = time.Now().Add(-2 * time.Hour)
+
+	req := connect.NewRequest(&v1.FetchTaskRequest{})
+	setBearer(req, sessionToken)
+	if _, err := h.FetchTask(context.Background(), req); err != nil {
+		t.Fatalf("FetchTask failed: %v", err)
+	}
+
+	if time.Since(sess.LastActivity) > time.Minute {
+		t.Errorf("FetchTask did not refresh LastActivity: %v ago", time.Since(sess.LastActivity))
+	}
+	// The refreshed session must survive an Expire pass that would have
+	// reaped it before the touch.
+	if got := sm.Expire(time.Now(), 30*time.Minute); len(got) != 0 {
+		t.Fatalf("touched session expired: %+v", got)
+	}
+}
+
+// TestAuthenticate_OneJob_TouchesSession verifies the auto-registration path
+// also keeps the session fresh: the first RPC creates the session with
+// LastActivity initialized, and subsequent RPCs on the same token refresh it.
+func TestAuthenticate_OneJob_TouchesSession(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	regToken := "touch-onejob-token"
+	newTaskCtx(ms, 42, regToken, "inst-a")
+
+	// First RPC auto-registers via the reg-token path.
+	req := connect.NewRequest(&v1.FetchTaskRequest{})
+	setRunnerToken(req, regToken)
+	if _, err := h.FetchTask(context.Background(), req); err != nil {
+		t.Fatalf("FetchTask failed: %v", err)
+	}
+
+	sess, ok := sm.Lookup(regToken)
+	if !ok {
+		t.Fatal("session not created by one-job auto-registration")
+	}
+	if sess.LastActivity.IsZero() {
+		t.Fatal("auto-registered session has no LastActivity")
+	}
+
+	// Backdate, then a second RPC on the same token (now a session lookup
+	// hit) must refresh it.
+	sess.LastActivity = time.Now().Add(-2 * time.Hour)
+
+	req2 := connect.NewRequest(&v1.FetchTaskRequest{})
+	setRunnerToken(req2, regToken)
+	if _, err := h.FetchTask(context.Background(), req2); err != nil {
+		t.Fatalf("second FetchTask failed: %v", err)
+	}
+
+	if time.Since(sess.LastActivity) > time.Minute {
+		t.Errorf("second FetchTask did not refresh LastActivity: %v ago", time.Since(sess.LastActivity))
+	}
+}
+
+// TestAuthenticate_VanishedSession verifies a request for a session that no
+// longer exists is rejected with Unauthenticated: authenticate must never
+// proceed with a dead session, whether the removal lands before the Lookup
+// or in the Lookup→Touch window (where Touch reports false and the request
+// is rejected the same way).
+func TestAuthenticate_VanishedSession(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	regToken := "vanish-token"
+	newTaskCtx(ms, 42, regToken, "inst-a")
+	sessionToken := registerTask(t, h, regToken, 42)
+
+	// Remove the session out from under authenticate: Lookup still hits the
+	// pointer captured below, but Touch fails.
+	sm.Remove(sessionToken)
+
+	req := connect.NewRequest(&v1.FetchTaskRequest{})
+	setBearer(req, sessionToken)
+	_, err := h.FetchTask(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error for a session removed during authentication")
+	}
+	if connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("expected Unauthenticated, got %v", connect.CodeOf(err))
+	}
+}
+
 // ── Tests: NewServer ───────────────────────────────────────────────────────
 
 func TestNewServer(t *testing.T) {

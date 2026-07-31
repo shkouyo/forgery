@@ -52,6 +52,7 @@ type TaskCtx struct {
 	DispatchedAt       time.Time     // When workflow_dispatch succeeded
 	RunnerRegisteredAt time.Time     // When the internal runner completed Register
 	done               chan struct{} // closed when task reaches terminal state
+	registered         chan struct{} // closed when the internal runner completes Register
 }
 
 // Status returns the current task status under a read lock.
@@ -85,13 +86,15 @@ func (t *TaskCtx) MarkDispatched() {
 	t.DispatchedAt = time.Now()
 }
 
-// MarkRunnerRegistered transitions the task to StatusRunning and records the
-// runner registration timestamp under a write lock.
+// MarkRunnerRegistered transitions the task to StatusRunning, records the
+// runner registration timestamp, and closes the registered channel exactly
+// once under a write lock. Safe to call multiple times (idempotent).
 func (t *TaskCtx) MarkRunnerRegistered() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.status = StatusRunning
 	t.RunnerRegisteredAt = time.Now()
+	closeSignal(t.ensureRegistered())
 }
 
 // ensureDone lazily initialises and returns the done channel.
@@ -108,13 +111,7 @@ func (t *TaskCtx) ensureDone() chan struct{} {
 func (t *TaskCtx) MarkDone() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.ensureDone()
-	select {
-	case <-t.done:
-		// already closed
-	default:
-		close(t.done)
-	}
+	closeSignal(t.ensureDone())
 }
 
 // Done returns a channel that is closed when the task reaches a terminal state.
@@ -124,6 +121,38 @@ func (t *TaskCtx) Done() <-chan struct{} {
 	d := t.ensureDone()
 	t.mu.Unlock()
 	return d
+}
+
+// ensureRegistered lazily initialises and returns the registered channel.
+// The caller must hold t.mu.
+func (t *TaskCtx) ensureRegistered() chan struct{} {
+	if t.registered == nil {
+		t.registered = make(chan struct{})
+	}
+	return t.registered
+}
+
+// Registered returns a channel that is closed when the internal runner has
+// completed registration for this task. HandleTask selects on it to learn
+// when the GAStartupTimeout no longer applies. Callers can select on this
+// channel to be notified of runner registration.
+func (t *TaskCtx) Registered() <-chan struct{} {
+	t.mu.Lock()
+	ch := t.ensureRegistered()
+	t.mu.Unlock()
+	return ch
+}
+
+// closeSignal closes ch if it is not already closed. The caller must hold
+// t.mu; it makes MarkDone and MarkRunnerRegistered idempotent under
+// concurrent callers.
+func closeSignal(ch chan struct{}) {
+	select {
+	case <-ch:
+		// already closed
+	default:
+		close(ch)
+	}
 }
 
 // TaskStore is the abstract interface for task context storage. All methods

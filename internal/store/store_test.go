@@ -564,6 +564,68 @@ func TestMarkDone_Concurrent(t *testing.T) {
 	<-tc.Done()
 }
 
+// ---- Registered signal (F1: run waits on it to end the startup timeout) ----
+
+// TestRegistered_OpenBeforeRegistration verifies the channel is open until
+// the runner registers, so HandleTask's phase-1 select actually waits.
+func TestRegistered_OpenBeforeRegistration(t *testing.T) {
+	tc := newTestTask(1, "tok")
+	select {
+	case <-tc.Registered():
+		t.Fatal("Registered channel closed before MarkRunnerRegistered")
+	default:
+	}
+}
+
+// TestRegistered_Idempotent verifies MarkRunnerRegistered closes the channel
+// exactly once and can be called any number of times without panicking.
+func TestRegistered_Idempotent(t *testing.T) {
+	tc := newTestTask(1, "tok")
+
+	tc.MarkRunnerRegistered()
+	tc.MarkRunnerRegistered()
+	tc.MarkRunnerRegistered()
+
+	select {
+	case <-tc.Registered():
+		// closed as expected
+	default:
+		t.Fatal("Registered channel not closed after MarkRunnerRegistered")
+	}
+
+	// Marking again after closure must stay safe.
+	tc.MarkRunnerRegistered()
+	<-tc.Registered()
+}
+
+// TestRegistered_Concurrent verifies concurrent MarkRunnerRegistered calls
+// close the channel exactly once (no double-close panic) under -race.
+func TestRegistered_Concurrent(t *testing.T) {
+	tc := newTestTask(1, "tok")
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			tc.MarkRunnerRegistered()
+		}()
+	}
+	wg.Wait()
+
+	select {
+	case <-tc.Registered():
+		// OK
+	default:
+		t.Fatal("Registered channel not closed after concurrent MarkRunnerRegistered")
+	}
+
+	// Still safe to call after closure.
+	tc.MarkRunnerRegistered()
+	<-tc.Registered()
+}
+
 // ---- T-STO-004: Custom TTL configuration ----
 
 func TestNewMemStore_DefaultTTLs(t *testing.T) {
