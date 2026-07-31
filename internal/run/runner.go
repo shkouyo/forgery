@@ -85,7 +85,11 @@ func failureUpdateRequest(taskID int64) *v1.UpdateTaskRequest {
 //  5. On completion (done signal from internal runner): stop heartbeat, release slot.
 //  6. On GA_STARTUP_TIMEOUT with no runner registered: report failure, stop
 //     heartbeat, drop session, release slot, remove from store.
-//  7. On context cancellation: graceful stop of heartbeat, release slot.
+//  7. On context cancellation: stop the heartbeat, release the slot. If the
+//     internal runner never registered, the task is also cleaned up fully
+//     (session dropped, store entry removed) so the daemon's drain phase
+//     can complete; a registered runner's task stays in the store for
+//     Forgejo re-assignment or the drain phase to wait out.
 //
 // The wait after dispatch has two phases (see Step 4): GAStartupTimeout
 // bounds only the wait for the internal runner to connect. Once the runner
@@ -196,13 +200,43 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		return
 
 	case <-ctx.Done():
-		// Global shutdown (e.g., SIGTERM). Stop the heartbeat but leave
-		// the task in the store — Forgejo will re-assign it when this
-		// runner disconnects.
-		r.log.Warn("task handling interrupted by shutdown", "task_id", taskCtx.ID)
-		hbCancel()
-		r.pool.Release()
-		return
+		// Global shutdown (e.g., SIGTERM). Whether the task stays in the
+		// store depends on whether the internal runner ever registered:
+		//
+		//   - Never registered: the runner never connected (e.g. the
+		//     GitHub Actions job failed to start), so no internal runner
+		//     depends on this task. Clean up fully — drop any session,
+		//     remove the store entry, release the slot — so the daemon's
+		//     drain phase (CountActive == 0) can complete instead of
+		//     waiting out the full drain timeout. The task itself still
+		//     exists in Forgejo and is re-assigned when this runner
+		//     disconnects, preserving the original re-assignment
+		//     semantics.
+		//
+		//   - Registered: the internal runner is executing the task.
+		//     Leave the task in the store — the drain phase waits for it
+		//     to reach a terminal state (or the drain timeout), and
+		//     Forgejo re-assigns it when this runner disconnects.
+		//
+		// The probe is a non-blocking read of the Registered signal: the
+		// select above woke on ctx.Done, so registration had not closed
+		// that channel at that instant; this re-check only closes the
+		// race where the runner registers between the select waking and
+		// this probe.
+		select {
+		case <-taskCtx.Registered():
+			r.log.Warn("task handling interrupted by shutdown (runner registered, leaving task in store)", "task_id", taskCtx.ID)
+			hbCancel()
+			r.pool.Release()
+			return
+		default:
+			r.log.Warn("task handling interrupted by shutdown (runner never registered, cleaning up)", "task_id", taskCtx.ID)
+			hbCancel()
+			r.sessions.Remove(taskCtx.SessionToken)
+			r.store.Remove(taskCtx.ID)
+			r.pool.Release()
+			return
+		}
 	}
 
 	// Phase 2: waiting for the terminal state of a registered runner. The
@@ -217,9 +251,12 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		r.pool.Release()
 
 	case <-ctx.Done():
-		// Global shutdown (e.g., SIGTERM). Stop the heartbeat but leave
-		// the task in the store — Forgejo will re-assign it when this
-		// runner disconnects.
+		// Global shutdown (e.g., SIGTERM). Reached phase 2 only via the
+		// Registered case above, so the internal runner is executing this
+		// task: stop the heartbeat and release the slot, but leave the
+		// task and its session in the store — the drain phase waits for
+		// the runner's terminal UpdateTask (or the drain timeout), and
+		// Forgejo re-assigns the task when this runner disconnects.
 		r.log.Warn("task handling interrupted by shutdown", "task_id", taskCtx.ID)
 		hbCancel()
 		r.pool.Release()

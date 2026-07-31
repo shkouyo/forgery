@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -47,6 +48,17 @@ const drainPollInterval = 1 * time.Second
 // kept when logging a truncated preview; full tokens never appear in logs.
 const tokenPreviewLength = 8
 
+// startupRPCTimeout bounds each per-instance startup RPC (Register/Declare).
+// The northbound http.Client has no ResponseHeaderTimeout (see north.New),
+// so a blackholed Forgejo connection — packets accepted, no reply — would
+// otherwise hang startup forever. 30s matches the dispatch module's
+// httpClientTimeout, keeping all outbound HTTP budgets on the same order of
+// magnitude, and is short enough that a broken instance fails fast. It
+// applies to Declare exactly as to Register: with a persisted identity the
+// Register is skipped, but the Declare that replaces it must not hang
+// either.
+const startupRPCTimeout = 30 * time.Second
+
 // instanceEntry binds one configured Forgejo instance to its northbound
 // client. Entries are inserted before any goroutine starts and never
 // modified afterwards, so the resolver map needs no locking.
@@ -76,16 +88,57 @@ type poller interface {
 	PollLoop(ctx context.Context, pool *slots.Pool, taskCh chan<- *store.TaskCtx)
 }
 
+// instanceRegistrar is the per-instance startup surface of the northbound
+// client: identity check plus the Register/Declare RPCs. The concrete
+// *client returned by north.New satisfies it structurally; defining the
+// interface here keeps registerInstance testable with a fake.
+type instanceRegistrar interface {
+	HasIdentity() bool
+	Identity() state.Identity
+	Register(ctx context.Context) error
+	Declare(ctx context.Context) error
+}
+
+// registerInstance registers the runner with Forgejo (skipped when a
+// persisted identity exists) and then declares its labels and version. Each
+// RPC is bounded by timeout so a blackholed Forgejo connection cannot hang
+// startup indefinitely; the timeout applies to Declare exactly as to
+// Register. Errors name the failing stage.
+func registerInstance(ctx context.Context, c instanceRegistrar, timeout time.Duration, log *slog.Logger) error {
+	if c.HasIdentity() {
+		log.Info("runner identity found, skipping registration", "runner_uuid", c.Identity().UUID)
+	} else {
+		log.Info("registering runner with Forgejo")
+		regCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := c.Register(regCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("runner registration failed: %w", err)
+		}
+	}
+
+	log.Info("declaring runner labels and version")
+	declCtx, cancel := context.WithTimeout(ctx, timeout)
+	err := c.Declare(declCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("runner declaration failed: %w", err)
+	}
+	return nil
+}
+
 // Run assembles the daemon and blocks until a SIGINT/SIGTERM signal arrives,
 // then performs the graceful shutdown sequence and returns nil. Any startup
 // failure (config already validated by the caller, identity store errors,
-// Register/Declare failures) is returned as a descriptive error — the caller
-// decides how to exit.
+// Register/Declare failures, south/health bind failures) is returned as a
+// descriptive error — the caller decides how to exit.
 //
 // Shutdown sequence:
 //  1. Cancel the daemon context: pollers stop fetching, HandleTask aborts.
 //  2. Drain active tasks, polling taskStore.CountActive until zero or until
-//     the drain timeout (max of all instances' GAStartupTimeout) elapses.
+//     the drain timeout (max of all instances' GAStartupTimeout) elapses. A
+//     drain timeout returns an error so the caller exits non-zero; a second
+//     SIGINT/SIGTERM during this phase forces an immediate exit.
 //  3. Shut down the south HTTP server gracefully (httpShutdownTimeout).
 //  4. Shut down the health HTTP server gracefully (same budget).
 func Run(cfg *config.Config, log *slog.Logger) error {
@@ -111,18 +164,11 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 		}
 
 		// Register only when no persisted identity exists; Declare always
-		// confirms connectivity and refreshes labels/version.
-		if c.HasIdentity() {
-			instLog.Info("runner identity found, skipping registration", "runner_uuid", c.Identity().UUID)
-		} else {
-			instLog.Info("registering runner with Forgejo")
-			if err := c.Register(regCtx); err != nil {
-				return fmt.Errorf("instance %q: runner registration failed: %w", inst.Name, err)
-			}
-		}
-		instLog.Info("declaring runner labels and version")
-		if err := c.Declare(regCtx); err != nil {
-			return fmt.Errorf("instance %q: runner declaration failed: %w", inst.Name, err)
+		// confirms connectivity and refreshes labels/version. Both are
+		// bounded by startupRPCTimeout so a blackholed Forgejo cannot
+		// hang startup (see registerInstance).
+		if err := registerInstance(regCtx, c, startupRPCTimeout, instLog); err != nil {
+			return fmt.Errorf("instance %q: %w", inst.Name, err)
 		}
 
 		resolver[inst.Name] = instanceEntry{inst: inst, client: c}
@@ -141,6 +187,16 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	sessionMgr := session.NewManager()
 	southHandler := south.NewHandler(taskStore, sessionMgr, resolver, log)
 	srv := south.NewServer(southHandler, cfg.Global.ListenAddr)
+
+	// Bind the south listener synchronously before any goroutine starts:
+	// a busy or invalid port must fail the daemon fast instead of letting
+	// ListenAndServe fail in the background (where the daemon would keep
+	// running without a south server). Serve below only accepts on the
+	// already-bound listener, so there is no double bind.
+	listener, err := net.Listen("tcp", cfg.Global.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("south: listen on %s: %w", cfg.Global.ListenAddr, err)
+	}
 	runner := run.New(pool, dispatcher, taskStore, resolver, sessionMgr, log)
 
 	// ── background services ──
@@ -168,12 +224,21 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 
 	go func() {
 		log.Info("south HTTP server starting", "addr", cfg.Global.ListenAddr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		// The listener was bound synchronously above, so a failure here is
+		// a rare runtime error (e.g. the listener was closed externally);
+		// log it and keep the daemon running rather than fail startup.
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Error("south HTTP server error", "err", err)
 		}
 	}()
 
-	healthSrv := observability.StartHealthServer(cfg.Global.HealthAddr, observability.NewHealthChecker())
+	// Bind the health server synchronously too: an occupied health port is
+	// a startup failure, not a silent degradation. A nil server (empty
+	// health_addr) is a no-op.
+	healthSrv, err := observability.StartHealthServer(cfg.Global.HealthAddr, observability.NewHealthChecker())
+	if err != nil {
+		return fmt.Errorf("health server: %w", err)
+	}
 
 	// ── wait for shutdown signal ──
 	sigCh := make(chan os.Signal, 1)
@@ -181,33 +246,31 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	sig := <-sigCh
 	log.Info("received signal, starting graceful shutdown", "signal", sig.String())
 
+	// Re-arm signal handling: a second SIGINT/SIGTERM during the drain
+	// phase forces an immediate exit with a non-zero code instead of
+	// letting the daemon hang until the drain timeout. The goroutine
+	// closes over log, so the forced exit is logged with the daemon's
+	// structured logger. os.Exit deliberately skips deferred cleanup.
+	forceCh := make(chan os.Signal, 1)
+	signal.Notify(forceCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-forceCh
+		log.Error("second signal received, forcing immediate exit", "signal", sig.String())
+		os.Exit(1)
+	}()
+
 	// ── graceful shutdown sequence ──
 
 	// Step 1: stop accepting new work.
 	cancel()
 
 	// Step 2: wait for active tasks to drain (with timeout = max of all
-	// instances' GAStartupTimeout, per design decision 5).
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), maxGAStartupTimeout(cfg))
-	defer shutdownCancel()
-
-	ticker := time.NewTicker(drainPollInterval)
-	defer ticker.Stop()
-
-drain:
-	for {
-		active := taskStore.CountActive()
-		if active == 0 {
-			log.Info("all tasks drained")
-			break
-		}
-		select {
-		case <-ticker.C:
-			log.Info("waiting for tasks to drain", "active", active)
-		case <-shutdownCtx.Done():
-			log.Warn("shutdown timeout, forcing exit", "remaining", active)
-			break drain
-		}
+	// instances' GAStartupTimeout, per design decision 5). A timeout is a
+	// forcing condition: it does not stop the HTTP shutdown steps below,
+	// but it makes Run return an error so the process exits non-zero.
+	var drainErr error
+	if err := drainTasks(taskStore, maxGAStartupTimeout(cfg), drainPollInterval, log); err != nil {
+		drainErr = err
 	}
 
 	// Step 3+4: shut down the south HTTP server and the health server
@@ -223,8 +286,39 @@ drain:
 		}
 	}
 
+	if drainErr != nil {
+		return drainErr
+	}
 	log.Info("forgery stopped gracefully")
 	return nil
+}
+
+// drainTasks waits until the store reports no active tasks, polling every
+// pollInterval, bounded by timeout. It returns nil once drained and an error
+// describing the forced-exit condition when the timeout elapses first. It is
+// a separate function so the timeout path is testable without exercising the
+// whole signal/serve lifecycle.
+func drainTasks(taskStore store.TaskStore, timeout, pollInterval time.Duration, log *slog.Logger) error {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
+	defer shutdownCancel()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		active := taskStore.CountActive()
+		if active == 0 {
+			log.Info("all tasks drained")
+			return nil
+		}
+		select {
+		case <-ticker.C:
+			log.Info("waiting for tasks to drain", "active", active)
+		case <-shutdownCtx.Done():
+			log.Warn("shutdown timeout, forcing exit", "remaining", active)
+			return fmt.Errorf("shutdown timeout: %d task(s) still active after %v", active, timeout)
+		}
+	}
 }
 
 // maxGAStartupTimeout returns the largest GAStartupTimeout across all

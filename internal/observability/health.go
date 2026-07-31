@@ -2,6 +2,9 @@ package observability
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 )
 
@@ -30,25 +33,29 @@ func (hc *HealthChecker) probe(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// StartHealthServer starts the health HTTP server on the given address.
-// If addr is empty the call is a no-op and returns nil. The server runs in a
-// background goroutine; the returned *http.Server lets the caller shut it
-// down gracefully via Shutdown as part of the daemon's shutdown sequence.
-func StartHealthServer(addr string, hc *HealthChecker) *http.Server {
-	return startHTTPServer(addr, hc.Handler())
-}
-
-// startHTTPServer starts an HTTP server on the given address with the given handler.
-// If addr is empty the call is a no-op and returns nil. The server runs in a
-// background goroutine; the returned *http.Server lets the caller shut it
-// down gracefully via Shutdown.
-func startHTTPServer(addr string, handler http.Handler) *http.Server {
+// StartHealthServer binds the health HTTP server on the given address and
+// serves it in a background goroutine. Binding is synchronous so an occupied
+// or invalid address is reported as an error — the caller can fail the
+// daemon's startup instead of silently degrading. An empty addr is a no-op
+// and returns (nil, nil). The returned *http.Server lets the caller shut it
+// down gracefully via Shutdown as part of the daemon's shutdown sequence;
+// runtime Serve errors (after a successful bind) are logged via slog and do
+// not propagate.
+func StartHealthServer(addr string, hc *HealthChecker) (*http.Server, error) {
 	if addr == "" {
-		return nil
+		return nil, nil
 	}
-	srv := &http.Server{Addr: addr, Handler: handler}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("health: listen on %s: %w", addr, err)
+	}
+	srv := &http.Server{Addr: addr, Handler: hc.Handler()}
 	go func() {
-		_ = srv.ListenAndServe()
+		// The bind succeeded above, so a Serve failure here is a rare
+		// runtime error; log it and keep the daemon running.
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			slog.Error("health HTTP server error", "addr", addr, "err", err)
+		}
 	}()
-	return srv
+	return srv, nil
 }

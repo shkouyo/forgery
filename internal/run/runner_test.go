@@ -523,22 +523,28 @@ func TestHandleTask_NoSession_RemoveSafe(t *testing.T) {
 	}
 }
 
-// TestHandleTask_ContextCancellation verifies graceful exit on context
-// cancellation (e.g., global shutdown).
-func TestHandleTask_ContextCancellation(t *testing.T) {
+// TestHandleTask_ContextCancellation_UnregisteredCleansUp verifies the F3
+// semantics on shutdown for a task whose runner never connected: the task
+// is fully cleaned up — session dropped, store entry removed, slot
+// released — so the daemon's drain phase (CountActive == 0) can complete
+// instead of waiting out the full drain timeout. The task itself still
+// lives in Forgejo and is re-assigned when the runner disconnects.
+func TestHandleTask_ContextCancellation_UnregisteredCleansUp(t *testing.T) {
 	st := store.NewMemStore()
 	disp := &mockDispatcher{}
 	nc := &mockNorthClient{
 		heartbeatDone: make(chan struct{}),
 	}
+	sess := &mockSessionRemover{}
 
 	taskCtx := newTaskCtx(3, "inst-a")
+	taskCtx.SetSessionToken("sess-3")
 	st.PutPending(taskCtx)
 
 	instances := map[string]instanceEntry{
 		"inst-a": entry("inst-a", 10*time.Second, nc),
 	} // long timeout, won't fire
-	r, pool := newRunner(instances, disp, st)
+	r, pool := newRunnerWithSessions(instances, disp, st, sess)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -548,7 +554,8 @@ func TestHandleTask_ContextCancellation(t *testing.T) {
 		close(done)
 	}()
 
-	// Give HandleTask time to dispatch and start heartbeat.
+	// Give HandleTask time to dispatch and start heartbeat; the runner
+	// never registers before shutdown.
 	time.Sleep(50 * time.Millisecond)
 
 	// Cancel the context (simulating shutdown).
@@ -567,9 +574,81 @@ func TestHandleTask_ContextCancellation(t *testing.T) {
 		t.Fatal("slot not released after context cancellation")
 	}
 
-	// Task should remain in store (not removed on shutdown).
-	if _, ok := st.GetByID(3); !ok {
-		t.Error("task should remain in store after context cancellation (for re-assignment)")
+	// A never-registered task must be removed from the store so the drain
+	// phase completes (re-assignment happens on the Forgejo side).
+	if _, ok := st.GetByID(3); ok {
+		t.Error("unregistered task should be removed from store on shutdown")
+	}
+
+	// Its session must be dropped too.
+	if got := sess.removedTokens(); len(got) != 1 || got[0] != "sess-3" {
+		t.Errorf("session removes = %v, want [sess-3]", got)
+	}
+}
+
+// TestHandleTask_ContextCancellation_RegisteredStaysInStore verifies the F3
+// semantics on shutdown for a task whose runner IS connected: the task stays
+// in the store so the drain phase can wait for it to finish (or the drain
+// timeout to elapse), and the session survives so the runner's terminal
+// UpdateTask can still be processed during drain.
+func TestHandleTask_ContextCancellation_RegisteredStaysInStore(t *testing.T) {
+	st := store.NewMemStore()
+	disp := &mockDispatcher{}
+	nc := &mockNorthClient{
+		heartbeatDone: make(chan struct{}),
+	}
+	sess := &mockSessionRemover{}
+
+	taskCtx := newTaskCtx(4, "inst-a")
+	taskCtx.SetSessionToken("sess-4")
+	st.PutPending(taskCtx)
+
+	instances := map[string]instanceEntry{
+		"inst-a": entry("inst-a", 10*time.Second, nc),
+	} // long timeout, won't fire
+	r, pool := newRunnerWithSessions(instances, disp, st, sess)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		r.HandleTask(ctx, taskCtx)
+		close(done)
+	}()
+
+	// Give HandleTask time to dispatch and start heartbeat, then have the
+	// internal runner register (south's MarkRunnerRegistered) and let
+	// HandleTask reach phase 2.
+	time.Sleep(50 * time.Millisecond)
+	taskCtx.MarkRunnerRegistered()
+	time.Sleep(30 * time.Millisecond)
+
+	// Cancel the context (simulating shutdown).
+	cancel()
+
+	// Wait for HandleTask to complete.
+	select {
+	case <-done:
+		// OK
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleTask did not complete after context cancellation")
+	}
+
+	// Verify slot was released.
+	if !slotFree(t, pool) {
+		t.Fatal("slot not released after context cancellation")
+	}
+
+	// A registered task must stay in the store: the drain phase waits for
+	// its terminal state or the drain timeout.
+	if _, ok := st.GetByID(4); !ok {
+		t.Error("registered task should remain in store after context cancellation (drain waits for it)")
+	}
+
+	// Its session must survive so the runner's terminal UpdateTask can
+	// still be processed during drain.
+	if got := sess.removedTokens(); len(got) != 0 {
+		t.Errorf("session must survive shutdown while the runner is executing, got removes %v", got)
 	}
 }
 
