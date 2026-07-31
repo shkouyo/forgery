@@ -8,6 +8,8 @@
 
 Forgery connects to your Forgejo instance as an Actions runner, polling for tasks via the standard gRPC protocol. When a task arrives, Forgery triggers a `workflow_dispatch` event on GitHub Actions. The workflow launches the official `forgejo-runner` binary in ephemeral `one-job` mode, which connects back to Forgery's southbound gRPC endpoint, fetches the actual task from Forgejo through Forgery, executes it in a container, and streams logs and results back through Forgery to Forgejo.
 
+A single Forgery process can serve multiple Forgejo instances at once: each instance gets its own runner identity and task poller, all sharing one southbound endpoint.
+
 ## Quick Start
 
 **1. Clone and build**
@@ -22,27 +24,33 @@ Prerequisites: Go 1.25.0.
 
 **2. Copy the workflow template**
 
-Copy `templates/forgery-runner.yml` to `.github/workflows/` in the repository specified by `GITHUB_REPO`:
+Copy `templates/forgery-runner.yml` to `.github/workflows/` in the repository specified by `github_repo`:
 
 ```sh
 cp templates/forgery-runner.yml /path/to/your/repo/.github/workflows/
 ```
 
-**3. Set environment variables**
+**3. Create the configuration file**
 
-Create a `.env` file or export these environment variables:
+Copy the commented example and fill in your values:
 
-```env
-# Forgejo connection
-FORGEJO_URL=https://forgejo.example.com
-FORGEJO_RUNNER_TOKEN=your-runner-registration-token
-FORGEJO_RUNNER_NAME=forgery-proxy
-FORGEJO_RUNNER_LABELS=ubuntu-latest:docker://node:20-bookworm,docker:docker://ghcr.io/catthehacker/ubuntu:act-latest
+```sh
+cp forgery.toml.example forgery.toml
+```
 
+At minimum, set the GitHub connection keys and the first instance's Forgejo settings:
+
+```toml
 # GitHub Actions connection
-GITHUB_TOKEN=github_pat_...
-GITHUB_REPO=your-org/your-repo
-GITHUB_WORKFLOW_ID=forgery-runner.yml
+github_token = "github_pat_..."
+github_repo = "your-org/your-repo"
+github_workflow_id = "forgery-runner.yml"
+
+[[instances]]
+forgejo_url = "https://forgejo.example.com"
+forgejo_runner_token = "your-runner-registration-token"
+forgejo_runner_name = "forgery-proxy"
+forgejo_runner_labels = "ubuntu-latest:docker://node:20-bookworm,docker:docker://ghcr.io/catthehacker/ubuntu:act-latest"
 ```
 
 **4. Run Forgery**
@@ -51,49 +59,62 @@ GITHUB_WORKFLOW_ID=forgery-runner.yml
 ./forgery
 ```
 
+Forgery loads `forgery.toml` from the current directory by default; pass `--config` to use another file (e.g. `./forgery --config /etc/forgery/forgery.toml`).
+
 **5. Configure a reverse proxy**
 
-Forgery listens on `:8443` for plain HTTP by default. Place a TLS-terminating reverse proxy (Caddy, nginx) in front of it for production use.
+Forgery listens on `:8443` for plain HTTP by default. Place a TLS-terminating reverse proxy (Caddy, nginx) in front of it for production use, and make sure `public_url` points at the public `https://` URL (when unset it is derived from the hostname and the `listen_addr` port).
 
 ## Configuration
 
-Forgery is configured entirely through environment variables, with an optional `.env` file as a fallback. The loading order is:
+Forgery is configured through a single TOML file, passed with `--config` (default: `forgery.toml` in the current directory). See `forgery.toml.example` at the repository root for a fully commented example. The loading chain is:
 
-1. `.env` file (silently skipped if missing)
-2. OS environment variables (override `.env`)
-3. Default values for unset fields
-4. Validation of required fields
+1. TOML file (a missing or unreadable file is an error)
+2. Default values for unset fields
+3. Validation of required fields and values
 
-### Environment Variable Reference
+Parsing is strict: unknown keys, invalid values (durations, integers, booleans), and missing required fields all abort startup — every problem found in a single pass is reported together. Instance names must be unique: they are the routing key that maps each task back to the Forgejo instance that owns it.
 
-| Variable | Required | Default | Description |
+### Global Keys
+
+| Key | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `FORGEJO_URL` | Yes | — | Forgejo instance base URL (e.g. `https://forgejo.example.com`) |
-| `FORGEJO_RUNNER_TOKEN` | Yes | — | Forgejo runner registration token |
-| `FORGEJO_RUNNER_NAME` | Yes | — | Display name shown in Forgejo's runner list |
-| `FORGEJO_RUNNER_LABELS` | Yes | — | Comma-separated labels with optional container image mappings (see [Labels](#labels)) |
-| `GITHUB_TOKEN` | Yes | — | GitHub personal access token with `workflow` scope (fine-grained, repo-scoped recommended) |
-| `GITHUB_REPO` | Yes | — | Repository holding the workflow, in `owner/repo` format |
-| `GITHUB_WORKFLOW_ID` | Yes | — | Workflow filename (e.g. `forgery-runner.yml`) or workflow ID |
-| `GITHUB_REF` | No | `main` | Branch ref to trigger the workflow on |
-| `GITHUB_API_URL` | No | `https://api.github.com` | GitHub API base URL (set for GitHub Enterprise) |
-| `LISTEN_ADDR` | No | `:8443` | Southbound gRPC listen address |
-| `PUBLIC_URL` | No | `https://<hostname>:8443` | Publicly reachable URL for Forgery (used by internal runners to connect back) |
-| `DEFAULT_CONTAINER_IMAGE` | No | — | Default container image for labels without an explicit `:docker://...` mapping |
-| `MAX_PARALLEL_TASKS` | No | `5` | Maximum number of concurrently executing tasks |
-| `POLL_INTERVAL` | No | `3s` | Interval between northbound `FetchTask` polls |
-| `REG_TOKEN_TTL` | No | `15m` | Lifetime of a one-time registration token |
-| `GA_STARTUP_TIMEOUT` | No | `15m` | Maximum time to wait for a GA workflow to start and the internal runner to register |
-| `HEARTBEAT_INTERVAL` | No | `30s` | Interval for sending `UpdateTask(state=running)` heartbeats while waiting for the internal runner |
-| `PING_KEEPALIVE` | No | `true` | Send Ping RPCs during backpressure to keep the Forgejo connection alive |
-| `LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, or `error` |
-| `LOG_FORMAT` | No | `json` | Log output format: `json` or `text` |
-| `HEALTH_ADDR` | No | — | Health check endpoint listen address (if set, exposes `/healthz` and `/readyz`) |
-| `TLS_INSECURE_SKIP_VERIFY` | No | `false` | Skip TLS certificate verification for northbound connections (development only) |
+| `log_level` | No | `info` | Log level: `debug`, `info`, `warn`, or `error` |
+| `log_format` | No | `json` | Log output format: `json` or `text` |
+| `health_addr` | No | — | Health probe server listen address; empty disables health checks (see [Health Checks](#health-checks)) |
+| `listen_addr` | No | `:8443` | Southbound gRPC listen address |
+| `public_url` | No | `https://<hostname>:<listen port>` | Publicly reachable URL for Forgery (used by internal runners to connect back) |
+| `state_file` | No | `<config dir>/forgery-state.json` | State file persisting runner identities across restarts |
+| `max_parallel_tasks` | No | `5` | Maximum number of concurrently executing tasks (one global budget across all instances) |
+| `github_token` | Yes | — | GitHub personal access token with `workflow` scope (fine-grained, repo-scoped recommended) |
+| `github_repo` | Yes | — | Repository holding the workflow, in `owner/repo` format |
+| `github_workflow_id` | Yes | — | Workflow filename (e.g. `forgery-runner.yml`) or workflow ID |
+| `github_ref` | No | `main` | Branch ref to trigger the workflow on |
+| `github_api_url` | No | `https://api.github.com` | GitHub API base URL (set for GitHub Enterprise) |
+
+### Instance Keys
+
+One `[[instances]]` entry per Forgejo connection (at least one is required):
+
+| Key | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `name` | No | host of `forgejo_url` | Unique instance name; the routing key for task → instance resolution |
+| `forgejo_url` | Yes | — | Forgejo instance base URL (e.g. `https://forgejo.example.com`) |
+| `forgejo_runner_token` | Yes | — | Forgejo runner registration token |
+| `forgejo_runner_name` | No | `forgery` | Display name shown in Forgejo's runner list |
+| `forgejo_runner_labels` | Yes | — | Comma-separated labels with optional container image mappings (see [Labels](#labels)) |
+| `default_container_image` | No | — | Default container image for labels without an explicit `:docker://...` mapping |
+| `poll_interval` | No | `3s` | Interval between northbound `FetchTask` polls |
+| `reg_token_ttl` | No | `15m` | Lifetime of a one-time registration token |
+| `ga_startup_timeout` | No | `15m` | Maximum time to wait for a GA workflow to start and the internal runner to register |
+| `heartbeat_interval` | No | `30s` | Interval for sending `UpdateTask(state=running)` heartbeats while waiting for the internal runner |
+| `tls_insecure_skip_verify` | No | `false` | Skip TLS certificate verification for northbound connections (development only) |
+
+`state_file` defaults to `forgery-state.json` next to the configuration file. Forgery persists the runner identity (UUID + permanent token) of every Forgejo instance in it, keyed by `forgejo_url`, so a restart reuses the same runner instead of registering an orphan. The file is written atomically with `0600` permissions; a corrupt or wrongly versioned file is a hard error at startup — identity data is never silently discarded.
 
 ### Labels
 
-`FORGEJO_RUNNER_LABELS` maps Forgejo `runs-on` labels to container images using the format:
+`forgejo_runner_labels` maps Forgejo `runs-on` labels to container images using the format:
 
 ```
 label1:docker://image1,label2:docker://image2
@@ -104,16 +125,20 @@ label1:docker://image1,label2:docker://image2
 
 Example:
 
-```env
-FORGEJO_RUNNER_LABELS=ubuntu-latest:docker://node:20-bookworm,docker:docker://ghcr.io/catthehacker/ubuntu:act-latest
-DEFAULT_CONTAINER_IMAGE=docker://ghcr.io/catthehacker/ubuntu:act-latest
+```toml
+forgejo_runner_labels = "ubuntu-latest:docker://node:20-bookworm,docker:docker://ghcr.io/catthehacker/ubuntu:act-latest"
+default_container_image = "docker://ghcr.io/catthehacker/ubuntu:act-latest"
 ```
 
 - When a Forgejo workflow specifies `runs-on: ubuntu-latest`, Forgery matches it and the runner executes in `node:20-bookworm`.
 - When `runs-on: docker`, it executes in `ghcr.io/catthehacker/ubuntu:act-latest`.
-- If a `runs-on` label has no explicit `:docker://...` suffix, `DEFAULT_CONTAINER_IMAGE` is used.
+- If a `runs-on` label has no explicit `:docker://...` suffix, `default_container_image` is used.
 
 The same label string is used for both northbound registration (so Forgejo knows which tasks to route to Forgery) and the internal runner configuration (so the GA workflow knows which container to use).
+
+### Health Checks
+
+When `health_addr` is set, Forgery runs a health probe HTTP server on that address: only `/healthz` and `/readyz` answer `200` with `{"status":"ok"}`, and any other path — including `/` — returns `404`. When `health_addr` is empty (the default), no health server is started. The health server is shut down gracefully as part of the daemon's shutdown sequence.
 
 ## How It Works
 
@@ -122,6 +147,10 @@ The same label string is used for both northbound registration (so Forgejo knows
 3. **The GA workflow starts a real `forgejo-runner`** — it downloads the official runner binary and launches it in `one-job` ephemeral mode, connecting back to Forgery's gRPC endpoint.
 4. **Forgery hands the Forgejo task to the internal runner** — the runner fetches the task, executes it inside a container, and reports results.
 5. **Logs and task status flow back** — `UpdateTask` and `UpdateLog` RPCs are transparently relayed through Forgery to Forgejo.
+
+**Multiple Forgejo instances** — each `[[instances]]` entry gets its own runner identity (registered against its own Forgejo) and its own task poller. Every task is tagged with its instance name; registration-token validation, heartbeats, and `UpdateTask`/`UpdateLog` forwarding are all routed through the owning instance's northbound client. The southbound side stays a single shared endpoint (`listen_addr`/`public_url` are global): the one-time registration token embedded in each `workflow_dispatch` is what maps a connecting internal runner back to its task, and therefore to its instance. `max_parallel_tasks` is one global concurrency budget shared by all instances' pollers.
+
+**Persistent runner identity** — after the first `Register`, Forgery saves the runner UUID and permanent token to the state file. On restart it reuses the same identity instead of registering a fresh orphan runner; if Forgejo rejects the permanent token (revoked or rotated), Forgery re-registers automatically and retries.
 
 ## Build & Test
 
@@ -143,26 +172,30 @@ go build ./cmd/forgery
 go test ./... -race
 ```
 
-All tests run with the `-race` flag by convention. The `store` and `session` packages include concurrent access tests.
+All tests run with the `-race` flag by convention. The `store`, `session`, `slots`, and `state` packages include concurrent access tests.
 
 ### Project Structure
 
 ```
 forgery/
-├── cmd/forgery/       # main entry
+├── cmd/forgery/       # main entry (flags, config load)
 ├── internal/
-│   ├── config/        # env var loading and defaults
+│   ├── app/           # daemon assembly and lifecycle (multi-instance wiring)
+│   ├── config/        # TOML loading, defaults, and validation
 │   ├── dispatch/      # GitHub Actions workflow_dispatch
 │   ├── north/         # northbound client (Forgery → Forgejo)
 │   ├── observability/ # logging and health checks
 │   ├── run/           # per-task orchestration
 │   ├── session/       # session lifecycle
+│   ├── slots/         # global backpressure pool (max_parallel_tasks)
 │   ├── south/         # southbound server (forgejo-runner → Forgery)
+│   ├── state/         # runner identity persistence (state file)
 │   ├── store/         # in-memory task/session storage
 │   ├── token/         # cryptographic token generation
 │   └── version/       # version constant
 ├── templates/
 │   └── forgery-runner.yml
+├── forgery.toml.example
 ├── go.mod / go.sum
 ├── COPYING            # GPL-3.0
 └── README.md
@@ -174,26 +207,34 @@ Module path: `git.0x0f.dev/forgery`.
 
 ### Northbound (Forgery → Forgejo)
 
-Forgery connects to Forgejo over HTTPS. Ensure `FORGEJO_URL` uses `https://`. For development with self-signed certificates, set `TLS_INSECURE_SKIP_VERIFY=true`.
+Forgery connects to Forgejo over HTTPS. Ensure `forgejo_url` uses `https://`. For development with self-signed certificates, set `tls_insecure_skip_verify = true` in the corresponding `[[instances]]` entry.
+
+### Configuration File Protection
+
+`forgery.toml` contains the GitHub token and the Forgejo registration tokens. Restrict its permissions (e.g. `chmod 600 forgery.toml`) and never commit it to version control.
 
 ### Southbound (internal runner → Forgery)
 
-TLS is terminated at the reverse proxy (Caddy or nginx). The proxy handles certificate management (e.g. Let's Encrypt). Internal `forgejo-runner` instances connect to `PUBLIC_URL` (which should be `https://`), trusting standard public CAs.
+TLS is terminated at the reverse proxy (Caddy or nginx). The proxy handles certificate management (e.g. Let's Encrypt). Internal `forgejo-runner` instances connect to `public_url` (which should be `https://`), trusting standard public CAs.
 
 ### One-Time Registration Tokens
 
 - Each task dispatch generates a unique registration token via `crypto/rand` (32 bytes, 256 bits of entropy).
 - Tokens are **single-use** — the first successful `Register` call consumes the token; subsequent attempts are rejected.
-- Tokens expire after `REG_TOKEN_TTL` (default 15 minutes).
+- Tokens expire after `reg_token_ttl` (default 15 minutes).
 - **Warning:** `reg_token` is passed as a `workflow_dispatch` input and is **visible in GitHub Actions workflow logs**. Restrict access to Actions logs in your repository settings as a precaution.
 
 ### Secrets Handling
 
 Forgejo repository secrets from incoming tasks are held **only in memory** and forwarded over TLS connections. They are never written to disk or logged.
 
+### State File
+
+The state file (default `forgery-state.json` next to the config file) contains runner credentials — the UUID and permanent token of every Forgejo instance — and is written with `0600` permissions. Protect it like a secret; deleting it makes Forgery register fresh runner identities on the next start.
+
 ### GitHub PAT
 
-- `GITHUB_TOKEN` should be a **fine-grained personal access token** scoped to a single repository.
+- `github_token` should be a **fine-grained personal access token** scoped to a single repository.
 - Minimum required permissions: `contents: read` and `actions: write`.
 - The built-in `GITHUB_TOKEN` in Actions workflows is used by the runner workflow itself and requires no extra configuration.
 

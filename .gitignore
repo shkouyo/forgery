@@ -7,3 +7,8 @@
 .env.*.local
 *.log
 /tmp/
+
+# Local runtime artifacts
+forgery.toml
+forgery-state.json
+.forgery-state.json.tmp-*

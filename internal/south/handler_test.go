@@ -15,9 +15,11 @@ import (
 	"connectrpc.com/connect"
 
 	"git.0x0f.dev/forgery/internal/config"
+	"git.0x0f.dev/forgery/internal/north"
 	"git.0x0f.dev/forgery/internal/session"
 	"git.0x0f.dev/forgery/internal/store"
 )
+
 // ── mockStore ──────────────────────────────────────────────────────────────
 
 // mockStore implements store.TaskStore for testing. It tracks calls and
@@ -34,10 +36,10 @@ type mockStore struct {
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		tasks:          make(map[string]*store.TaskCtx),
-		byID:           make(map[int64]*store.TaskCtx),
-		consumedTokens: make(map[string]bool),
-		removed:        make(map[int64]bool),
+		tasks:           make(map[string]*store.TaskCtx),
+		byID:            make(map[int64]*store.TaskCtx),
+		consumedTokens:  make(map[string]bool),
+		removed:         make(map[int64]bool),
 		getByRegTokenOk: true,
 	}
 }
@@ -108,10 +110,13 @@ func (m *mockStore) wasRemoved(taskID int64) bool {
 	return m.removed[taskID]
 }
 
-// ── mockForwarder ──────────────────────────────────────────────────────────
+// ── mockClient ─────────────────────────────────────────────────────────────
 
-// mockForwarder implements northForwarder for testing.
-type mockForwarder struct {
+// mockClient implements north.Client for testing. It tracks forwarding calls
+// per client so routing assertions can verify the correct instance's client
+// received the relay.
+type mockClient struct {
+	mu               sync.Mutex
 	updateTaskCalled int
 	updateLogCalled  int
 	lastUpdateTask   *v1.UpdateTaskRequest
@@ -122,50 +127,119 @@ type mockForwarder struct {
 	updateLogErr     error
 }
 
-func newMockForwarder() *mockForwarder {
-	return &mockForwarder{
+func newMockClient() *mockClient {
+	return &mockClient{
 		updateTaskResp: &v1.UpdateTaskResponse{},
 		updateLogResp:  &v1.UpdateLogResponse{},
 	}
 }
 
-func (m *mockForwarder) ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error) {
+func (m *mockClient) ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error) {
+	m.mu.Lock()
 	m.updateTaskCalled++
 	m.lastUpdateTask = req
+	m.mu.Unlock()
 	if m.updateTaskErr != nil {
 		return nil, m.updateTaskErr
 	}
 	return m.updateTaskResp, nil
 }
 
-func (m *mockForwarder) ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error) {
+func (m *mockClient) ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error) {
+	m.mu.Lock()
 	m.updateLogCalled++
 	m.lastUpdateLog = req
+	m.mu.Unlock()
 	if m.updateLogErr != nil {
 		return nil, m.updateLogErr
 	}
 	return m.updateLogResp, nil
 }
 
+func (m *mockClient) StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx) {
+	// Not exercised by the south handler.
+	<-ctx.Done()
+}
+
+// ── fakeResolver ───────────────────────────────────────────────────────────
+
+// fakeResolver implements north.Resolver with a static map, supporting two
+// instances with distinct TTLs for routing tests.
+type fakeResolver struct {
+	entries map[string]instanceEntry
+}
+
+func newFakeResolver(entries map[string]instanceEntry) *fakeResolver {
+	return &fakeResolver{entries: entries}
+}
+
+func (r *fakeResolver) Resolve(name string) (config.Instance, north.Client, bool) {
+	e, ok := r.entries[name]
+	if !ok {
+		return config.Instance{}, nil, false
+	}
+	return e.inst, e.client, true
+}
+
+// instanceEntry is one resolver map value.
+type instanceEntry struct {
+	inst   config.Instance
+	client north.Client
+}
+
+// mkEntry builds a resolver map value with the given TTL.
+func mkEntry(name string, ttl time.Duration, client north.Client) instanceEntry {
+	return instanceEntry{
+		inst:   config.Instance{Name: name, RegTokenTTL: ttl},
+		client: client,
+	}
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
-func newTestHandler(ms *mockStore, sm *session.Manager, fw *mockForwarder) *Handler {
-	return NewHandler(ms, sm, fw, &config.Config{
-		RegTokenTTL: 15 * time.Minute,
-	}, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+// testResolver returns a resolver with two instances: inst-a (15m TTL) and
+// inst-b (1m TTL), each with its own recording client.
+func testResolver() (*fakeResolver, *mockClient, *mockClient) {
+	clientA := newMockClient()
+	clientB := newMockClient()
+	resolver := newFakeResolver(map[string]instanceEntry{
+		"inst-a": mkEntry("inst-a", 15*time.Minute, clientA),
+		"inst-b": mkEntry("inst-b", 1*time.Minute, clientB),
+	})
+	return resolver, clientA, clientB
+}
+
+func newTestHandler(ms *mockStore, sm *session.Manager, resolver north.Resolver) *Handler {
+	return NewHandler(ms, sm, resolver,
+		slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 }
 
 // newTaskCtx creates a fresh TaskCtx with a real Forgejo Task payload, a
-// registration token, and an ID. The task is put into the mock store.
-func newTaskCtx(ms *mockStore, id int64, regToken string) *store.TaskCtx {
+// registration token, an ID, and an owning instance. The task is put into
+// the mock store.
+func newTaskCtx(ms *mockStore, id int64, regToken string, instance string) *store.TaskCtx {
 	taskCtx := &store.TaskCtx{
-		ID:       id,
-		Task:     &v1.Task{Id: id},
-		RegToken: regToken,
+		ID:        id,
+		Instance:  instance,
+		Task:      &v1.Task{Id: id},
+		RegToken:  regToken,
+		CreatedAt: time.Now(),
 	}
 	taskCtx.SetStatus(store.StatusPending)
 	ms.PutPending(taskCtx)
 	return taskCtx
+}
+
+// registerTask performs the Register RPC with the given registration token
+// and returns the session token.
+func registerTask(t *testing.T, h *Handler, regToken string, taskID int64) string {
+	t.Helper()
+	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
+	regResp, err := h.Register(context.Background(), regReq)
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	return regResp.Msg.GetRunner().GetToken()
 }
 
 // setBearer sets the Authorization header on a connect request.
@@ -186,6 +260,7 @@ func setRunnerUUID[T any](req *connect.Request[T], token string) {
 // discardLog is a logger that discards all output, used in tests for
 // sessionTokenFromRequest which requires a logger parameter.
 var discardLog = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.Level(999)}))
+
 // ── Tests: sessionTokenFromRequest ──────────────────────────────────────────
 
 func TestSessionTokenFromRequest_Bearer(t *testing.T) {
@@ -309,11 +384,11 @@ func TestSessionTokenFromRequest_RunnerTokenPreferredOverUUID(t *testing.T) {
 func TestRegister_ValidToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "valid-reg-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
+	taskCtx := newTaskCtx(ms, 42, regToken, "inst-a")
 	taskCtx.CreatedAt = time.Now() // fresh token
 
 	req := connect.NewRequest(&v1.RegisterRequest{
@@ -359,8 +434,8 @@ func TestRegister_ValidToken(t *testing.T) {
 func TestRegister_InvalidToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.RegisterRequest{
 		Token: "nonexistent",
@@ -378,11 +453,11 @@ func TestRegister_InvalidToken(t *testing.T) {
 func TestRegister_ExpiredToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "expired-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
+	taskCtx := newTaskCtx(ms, 42, regToken, "inst-a")
 	taskCtx.CreatedAt = time.Now().Add(-20 * time.Minute) // 20 minutes ago
 
 	req := connect.NewRequest(&v1.RegisterRequest{
@@ -398,15 +473,45 @@ func TestRegister_ExpiredToken(t *testing.T) {
 	}
 }
 
+// TestRegister_TTLByInstance verifies the per-instance TTL contract: the
+// same token age can be expired on one instance and still valid on another,
+// depending on each instance's reg_token_ttl.
+func TestRegister_TTLByInstance(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	age := 2 * time.Minute // older than inst-b's 1m TTL, younger than inst-a's 15m TTL
+
+	// inst-a (15m TTL): still valid.
+	taskA := newTaskCtx(ms, 1, "token-a", "inst-a")
+	taskA.CreatedAt = time.Now().Add(-age)
+	reqA := connect.NewRequest(&v1.RegisterRequest{Token: "token-a", Name: "runner-a"})
+	if _, err := h.Register(context.Background(), reqA); err != nil {
+		t.Errorf("inst-a register with %s-old token failed: %v (want success)", age, err)
+	}
+
+	// inst-b (1m TTL): expired at the same age.
+	taskB := newTaskCtx(ms, 2, "token-b", "inst-b")
+	taskB.CreatedAt = time.Now().Add(-age)
+	reqB := connect.NewRequest(&v1.RegisterRequest{Token: "token-b", Name: "runner-b"})
+	_, err := h.Register(context.Background(), reqB)
+	if err == nil {
+		t.Error("inst-b register with token older than its TTL succeeded, want Unauthenticated")
+	} else if connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Errorf("inst-b register error = %v, want Unauthenticated", connect.CodeOf(err))
+	}
+}
+
 func TestRegister_AlreadyConsumed(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "single-use-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
 	// First registration should succeed.
 	req1 := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "first"})
@@ -426,25 +531,39 @@ func TestRegister_AlreadyConsumed(t *testing.T) {
 	}
 }
 
+// TestRegister_UnknownInstance verifies the defensive routing path: a token
+// that maps to an unknown instance is rejected with CodeInternal.
+func TestRegister_UnknownInstance(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	regToken := "ghost-token"
+	newTaskCtx(ms, 42, regToken, "ghost-instance")
+
+	req := connect.NewRequest(&v1.RegisterRequest{Token: regToken})
+	_, err := h.Register(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error for unknown instance")
+	}
+	if connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("expected Internal, got %v", connect.CodeOf(err))
+	}
+}
+
 // ── Tests: Declare ─────────────────────────────────────────────────────────
 
 func TestDeclare_ValidSession(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "declare-test-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	// Register first to get a session.
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner", Labels: []string{"linux"}})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	// Now Declare.
 	declReq := connect.NewRequest(&v1.DeclareRequest{Version: "1.0.0", Labels: []string{"linux"}})
@@ -462,8 +581,8 @@ func TestDeclare_ValidSession(t *testing.T) {
 func TestDeclare_InvalidSession(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.DeclareRequest{})
 	setBearer(req, "nonexistent-session")
@@ -480,19 +599,13 @@ func TestDeclare_InvalidSession(t *testing.T) {
 func TestDeclare_ValidSessionRunnerToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "declare-runner-token-test"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner", Labels: []string{"linux"}})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	// Declare using x-runner-token header (forgejo-runner v12+ style).
 	declReq := connect.NewRequest(&v1.DeclareRequest{Version: "1.0.0", Labels: []string{"linux"}})
@@ -510,8 +623,8 @@ func TestDeclare_ValidSessionRunnerToken(t *testing.T) {
 func TestDeclare_MissingToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.DeclareRequest{})
 
@@ -527,19 +640,13 @@ func TestDeclare_MissingToken(t *testing.T) {
 func TestDeclare_ValidSessionRunnerUUID(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "declare-uuid-test"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner", Labels: []string{"linux"}})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	// Declare using x-runner-uuid header (forgejo-runner v13+ style).
 	declReq := connect.NewRequest(&v1.DeclareRequest{Version: "1.0.0", Labels: []string{"linux"}})
@@ -559,21 +666,14 @@ func TestDeclare_ValidSessionRunnerUUID(t *testing.T) {
 func TestFetchTask_ValidSession(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "fetch-test-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	taskCtx := newTaskCtx(ms, 42, regToken, "inst-a")
 	taskCtx.Task = &v1.Task{Id: 42} // the real Forgejo task
 
-	// Register first.
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	// FetchTask.
 	fetchReq := connect.NewRequest(&v1.FetchTaskRequest{})
@@ -594,8 +694,8 @@ func TestFetchTask_ValidSession(t *testing.T) {
 func TestFetchTask_InvalidSession(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.FetchTaskRequest{})
 	setBearer(req, "nonexistent")
@@ -612,8 +712,8 @@ func TestFetchTask_InvalidSession(t *testing.T) {
 func TestFetchTask_MissingToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.FetchTaskRequest{})
 
@@ -631,20 +731,13 @@ func TestFetchTask_MissingToken(t *testing.T) {
 func TestUpdateTask_Valid(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, clientA, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "update-test-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	// Register first.
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	// UpdateTask with running state.
 	updateReq := connect.NewRequest(&v1.UpdateTaskRequest{
@@ -662,8 +755,11 @@ func TestUpdateTask_Valid(t *testing.T) {
 	if resp.Msg == nil {
 		t.Fatal("expected response")
 	}
-	if fw.updateTaskCalled != 1 {
-		t.Fatalf("expected forwarder to be called once, got %d", fw.updateTaskCalled)
+	clientA.mu.Lock()
+	calledA := clientA.updateTaskCalled
+	clientA.mu.Unlock()
+	if calledA != 1 {
+		t.Fatalf("expected inst-a client to be called once, got %d", calledA)
 	}
 
 	// Session should still exist (non-terminal state).
@@ -675,19 +771,13 @@ func TestUpdateTask_Valid(t *testing.T) {
 func TestUpdateTask_TaskIDMismatch(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, clientA, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "mismatch-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	// UpdateTask with wrong task ID.
 	updateReq := connect.NewRequest(&v1.UpdateTaskRequest{
@@ -697,15 +787,17 @@ func TestUpdateTask_TaskIDMismatch(t *testing.T) {
 	})
 	setBearer(updateReq, sessionToken)
 
-	_, err = h.UpdateTask(context.Background(), updateReq)
+	_, err := h.UpdateTask(context.Background(), updateReq)
 	if err == nil {
 		t.Fatal("expected error for task ID mismatch")
 	}
 	if connect.CodeOf(err) != connect.CodeInvalidArgument {
 		t.Fatalf("expected InvalidArgument, got %v", connect.CodeOf(err))
 	}
-	// Forwarder should not have been called.
-	if fw.updateTaskCalled != 0 {
+	clientA.mu.Lock()
+	calledA := clientA.updateTaskCalled
+	clientA.mu.Unlock()
+	if calledA != 0 {
 		t.Fatal("forwarder should not be called on task ID mismatch")
 	}
 }
@@ -713,19 +805,13 @@ func TestUpdateTask_TaskIDMismatch(t *testing.T) {
 func TestUpdateTask_TerminalCleansUp(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, clientA, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "terminal-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	taskCtx := newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	// UpdateTask with terminal state (success).
 	updateReq := connect.NewRequest(&v1.UpdateTaskRequest{
@@ -760,27 +846,24 @@ func TestUpdateTask_TerminalCleansUp(t *testing.T) {
 	}
 
 	// Forwarder should have been called.
-	if fw.updateTaskCalled != 1 {
-		t.Fatalf("expected forwarder to be called, got %d", fw.updateTaskCalled)
+	clientA.mu.Lock()
+	calledA := clientA.updateTaskCalled
+	clientA.mu.Unlock()
+	if calledA != 1 {
+		t.Fatalf("expected forwarder to be called, got %d", calledA)
 	}
 }
 
 func TestUpdateTask_TerminalFailure(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "failure-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	taskCtx := newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	updateReq := connect.NewRequest(&v1.UpdateTaskRequest{
 		State: &v1.TaskState{
@@ -790,7 +873,7 @@ func TestUpdateTask_TerminalFailure(t *testing.T) {
 	})
 	setBearer(updateReq, sessionToken)
 
-	_, err = h.UpdateTask(context.Background(), updateReq)
+	_, err := h.UpdateTask(context.Background(), updateReq)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -809,19 +892,13 @@ func TestUpdateTask_TerminalFailure(t *testing.T) {
 func TestUpdateTask_TerminalCancelled(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "cancel-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	taskCtx := newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	updateReq := connect.NewRequest(&v1.UpdateTaskRequest{
 		State: &v1.TaskState{
@@ -831,7 +908,7 @@ func TestUpdateTask_TerminalCancelled(t *testing.T) {
 	})
 	setBearer(updateReq, sessionToken)
 
-	_, err = h.UpdateTask(context.Background(), updateReq)
+	_, err := h.UpdateTask(context.Background(), updateReq)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -850,8 +927,8 @@ func TestUpdateTask_TerminalCancelled(t *testing.T) {
 func TestUpdateTask_InvalidSession(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.UpdateTaskRequest{
 		State: &v1.TaskState{Id: 1},
@@ -870,26 +947,21 @@ func TestUpdateTask_InvalidSession(t *testing.T) {
 func TestUpdateTask_ForwardError(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	fw.updateTaskErr = errors.New("forward failed")
-	h := newTestHandler(ms, sm, fw)
+	resolver, clientA, _ := testResolver()
+	clientA.updateTaskErr = errors.New("forward failed")
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "fwd-err-token"
-	newTaskCtx(ms, 42, regToken).CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	updateReq := connect.NewRequest(&v1.UpdateTaskRequest{
 		State: &v1.TaskState{Id: 42},
 	})
 	setBearer(updateReq, sessionToken)
 
-	_, err = h.UpdateTask(context.Background(), updateReq)
+	_, err := h.UpdateTask(context.Background(), updateReq)
 	if err == nil {
 		t.Fatal("expected forward error to propagate")
 	}
@@ -898,24 +970,100 @@ func TestUpdateTask_ForwardError(t *testing.T) {
 	}
 }
 
+// TestUpdateTask_RoutesToOwningInstance verifies the routing matrix: each
+// task's UpdateTask is forwarded to the client of its own instance.
+func TestUpdateTask_RoutesToOwningInstance(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, clientA, clientB := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	// Two tasks, one per instance.
+	newTaskCtx(ms, 1, "token-a", "inst-a")
+	newTaskCtx(ms, 2, "token-b", "inst-b")
+	sessionA := registerTask(t, h, "token-a", 1)
+	sessionB := registerTask(t, h, "token-b", 2)
+
+	// UpdateTask on inst-a's task (running state).
+	reqA := connect.NewRequest(&v1.UpdateTaskRequest{
+		State: &v1.TaskState{Id: 1, Result: v1.Result_RESULT_UNSPECIFIED},
+	})
+	setBearer(reqA, sessionA)
+	if _, err := h.UpdateTask(context.Background(), reqA); err != nil {
+		t.Fatalf("UpdateTask on inst-a task: %v", err)
+	}
+
+	// UpdateTask on inst-b's task (running state).
+	reqB := connect.NewRequest(&v1.UpdateTaskRequest{
+		State: &v1.TaskState{Id: 2, Result: v1.Result_RESULT_UNSPECIFIED},
+	})
+	setBearer(reqB, sessionB)
+	if _, err := h.UpdateTask(context.Background(), reqB); err != nil {
+		t.Fatalf("UpdateTask on inst-b task: %v", err)
+	}
+
+	clientA.mu.Lock()
+	calledA := clientA.updateTaskCalled
+	lastA := clientA.lastUpdateTask
+	clientA.mu.Unlock()
+	clientB.mu.Lock()
+	calledB := clientB.updateTaskCalled
+	lastB := clientB.lastUpdateTask
+	clientB.mu.Unlock()
+
+	if calledA != 1 || lastA.GetState().GetId() != 1 {
+		t.Errorf("inst-a client calls = %d (last task %v), want 1 call for task 1", calledA, lastA)
+	}
+	if calledB != 1 || lastB.GetState().GetId() != 2 {
+		t.Errorf("inst-b client calls = %d (last task %v), want 1 call for task 2", calledB, lastB)
+	}
+}
+
+// TestUpdateTask_UnknownInstance verifies the defensive path: a session
+// bound to an unknown instance fails with CodeInternal and nothing is
+// forwarded.
+func TestUpdateTask_UnknownInstance(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, clientA, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	// Create a session directly for a task of an unknown instance.
+	taskCtx := newTaskCtx(ms, 5, "ghost-token", "ghost-instance")
+	sess := sm.CreateWithToken(taskCtx, "ghost-session", "", nil)
+
+	updateReq := connect.NewRequest(&v1.UpdateTaskRequest{
+		State: &v1.TaskState{Id: 5},
+	})
+	setBearer(updateReq, sess.SessionToken)
+
+	_, err := h.UpdateTask(context.Background(), updateReq)
+	if err == nil {
+		t.Fatal("expected error for unknown instance")
+	}
+	if connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("expected Internal, got %v", connect.CodeOf(err))
+	}
+	clientA.mu.Lock()
+	calledA := clientA.updateTaskCalled
+	clientA.mu.Unlock()
+	if calledA != 0 {
+		t.Fatal("no forward should happen for unknown instance")
+	}
+}
+
 // ── Tests: UpdateLog ───────────────────────────────────────────────────────
 
 func TestUpdateLog_Valid(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, clientA, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "log-test-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	logReq := connect.NewRequest(&v1.UpdateLogRequest{
 		TaskId: 42,
@@ -933,41 +1081,41 @@ func TestUpdateLog_Valid(t *testing.T) {
 	if resp.Msg == nil {
 		t.Fatal("expected response")
 	}
-	if fw.updateLogCalled != 1 {
-		t.Fatalf("expected forwarder called once, got %d", fw.updateLogCalled)
+	clientA.mu.Lock()
+	calledA := clientA.updateLogCalled
+	clientA.mu.Unlock()
+	if calledA != 1 {
+		t.Fatalf("expected forwarder called once, got %d", calledA)
 	}
 }
 
 func TestUpdateLog_TaskIDMismatch(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, clientA, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "log-mismatch-token"
-	taskCtx := newTaskCtx(ms, 42, regToken)
-	taskCtx.CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	logReq := connect.NewRequest(&v1.UpdateLogRequest{
 		TaskId: 99, // wrong
 	})
 	setBearer(logReq, sessionToken)
 
-	_, err = h.UpdateLog(context.Background(), logReq)
+	_, err := h.UpdateLog(context.Background(), logReq)
 	if err == nil {
 		t.Fatal("expected error for task ID mismatch")
 	}
 	if connect.CodeOf(err) != connect.CodeInvalidArgument {
 		t.Fatalf("expected InvalidArgument, got %v", connect.CodeOf(err))
 	}
-	if fw.updateLogCalled != 0 {
+	clientA.mu.Lock()
+	calledA := clientA.updateLogCalled
+	clientA.mu.Unlock()
+	if calledA != 0 {
 		t.Fatal("forwarder should not be called on mismatch")
 	}
 }
@@ -975,8 +1123,8 @@ func TestUpdateLog_TaskIDMismatch(t *testing.T) {
 func TestUpdateLog_InvalidSession(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.UpdateLogRequest{TaskId: 1})
 	setBearer(req, "nonexistent")
@@ -993,8 +1141,8 @@ func TestUpdateLog_InvalidSession(t *testing.T) {
 func TestUpdateLog_MissingToken(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	req := connect.NewRequest(&v1.UpdateLogRequest{TaskId: 1})
 
@@ -1010,24 +1158,19 @@ func TestUpdateLog_MissingToken(t *testing.T) {
 func TestUpdateLog_ForwardError(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	fw.updateLogErr = errors.New("log forward failed")
-	h := newTestHandler(ms, sm, fw)
+	resolver, clientA, _ := testResolver()
+	clientA.updateLogErr = errors.New("log forward failed")
+	h := newTestHandler(ms, sm, resolver)
 
 	regToken := "log-fwd-err-token"
-	newTaskCtx(ms, 42, regToken).CreatedAt = time.Now()
+	newTaskCtx(ms, 42, regToken, "inst-a")
 
-	regReq := connect.NewRequest(&v1.RegisterRequest{Token: regToken, Name: "runner"})
-	regResp, err := h.Register(context.Background(), regReq)
-	if err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-	sessionToken := regResp.Msg.GetRunner().GetToken()
+	sessionToken := registerTask(t, h, regToken, 42)
 
 	logReq := connect.NewRequest(&v1.UpdateLogRequest{TaskId: 42})
 	setBearer(logReq, sessionToken)
 
-	_, err = h.UpdateLog(context.Background(), logReq)
+	_, err := h.UpdateLog(context.Background(), logReq)
 	if err == nil {
 		t.Fatal("expected forward error to propagate")
 	}
@@ -1036,13 +1179,106 @@ func TestUpdateLog_ForwardError(t *testing.T) {
 	}
 }
 
+// TestUpdateLog_RoutesToOwningInstance verifies the routing matrix for log
+// relays: each task's UpdateLog goes to its own instance's client.
+func TestUpdateLog_RoutesToOwningInstance(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, clientA, clientB := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	newTaskCtx(ms, 1, "token-a", "inst-a")
+	newTaskCtx(ms, 2, "token-b", "inst-b")
+	sessionA := registerTask(t, h, "token-a", 1)
+	sessionB := registerTask(t, h, "token-b", 2)
+
+	reqA := connect.NewRequest(&v1.UpdateLogRequest{TaskId: 1})
+	setBearer(reqA, sessionA)
+	if _, err := h.UpdateLog(context.Background(), reqA); err != nil {
+		t.Fatalf("UpdateLog on inst-a task: %v", err)
+	}
+
+	reqB := connect.NewRequest(&v1.UpdateLogRequest{TaskId: 2})
+	setBearer(reqB, sessionB)
+	if _, err := h.UpdateLog(context.Background(), reqB); err != nil {
+		t.Fatalf("UpdateLog on inst-b task: %v", err)
+	}
+
+	clientA.mu.Lock()
+	calledA := clientA.updateLogCalled
+	lastA := clientA.lastUpdateLog
+	clientA.mu.Unlock()
+	clientB.mu.Lock()
+	calledB := clientB.updateLogCalled
+	lastB := clientB.lastUpdateLog
+	clientB.mu.Unlock()
+
+	if calledA != 1 || lastA.GetTaskId() != 1 {
+		t.Errorf("inst-a client log calls = %d (last task %v), want 1 for task 1", calledA, lastA)
+	}
+	if calledB != 1 || lastB.GetTaskId() != 2 {
+		t.Errorf("inst-b client log calls = %d (last task %v), want 1 for task 2", calledB, lastB)
+	}
+}
+
+// TestUpdateLog_UnknownInstance verifies the defensive path for log relays.
+func TestUpdateLog_UnknownInstance(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, clientA, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	taskCtx := newTaskCtx(ms, 5, "ghost-token", "ghost-instance")
+	sess := sm.CreateWithToken(taskCtx, "ghost-session", "", nil)
+
+	logReq := connect.NewRequest(&v1.UpdateLogRequest{TaskId: 5})
+	setBearer(logReq, sess.SessionToken)
+
+	_, err := h.UpdateLog(context.Background(), logReq)
+	if err == nil {
+		t.Fatal("expected error for unknown instance")
+	}
+	if connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("expected Internal, got %v", connect.CodeOf(err))
+	}
+	clientA.mu.Lock()
+	calledA := clientA.updateLogCalled
+	clientA.mu.Unlock()
+	if calledA != 0 {
+		t.Fatal("no log forward should happen for unknown instance")
+	}
+}
+
+// TestAuthenticate_OneJobUnknownInstance verifies the defensive path in the
+// one-job auto-registration flow: a registration token whose task belongs to
+// an unknown instance fails with CodeInternal.
+func TestAuthenticate_OneJobUnknownInstance(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
+
+	newTaskCtx(ms, 5, "ghost-token", "ghost-instance")
+
+	req := connect.NewRequest(&v1.FetchTaskRequest{})
+	setRunnerToken(req, "ghost-token")
+
+	_, err := h.FetchTask(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error for unknown instance")
+	}
+	if connect.CodeOf(err) != connect.CodeInternal {
+		t.Fatalf("expected Internal, got %v", connect.CodeOf(err))
+	}
+}
+
 // ── Tests: NewServer ───────────────────────────────────────────────────────
 
 func TestNewServer(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
-	h := newTestHandler(ms, sm, fw)
+	resolver, _, _ := testResolver()
+	h := newTestHandler(ms, sm, resolver)
 
 	srv := NewServer(h, ":0")
 	if srv == nil {
@@ -1086,9 +1322,9 @@ func TestNewServer(t *testing.T) {
 func TestNewHandler(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
-	fw := newMockForwarder()
+	resolver, _, _ := testResolver()
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	h := NewHandler(ms, sm, fw, &config.Config{RegTokenTTL: 10 * time.Minute}, log)
+	h := NewHandler(ms, sm, resolver, log)
 
 	if h == nil {
 		t.Fatal("expected non-nil handler")
@@ -1099,10 +1335,7 @@ func TestNewHandler(t *testing.T) {
 	if h.sessions != sm {
 		t.Fatal("sessions not set")
 	}
-	if h.forward != fw {
-		t.Fatal("forward not set")
-	}
-	if h.cfg.RegTokenTTL != 10*time.Minute {
-		t.Fatal("config not set correctly")
+	if h.resolver != resolver {
+		t.Fatal("resolver not set")
 	}
 }

@@ -1,7 +1,7 @@
 // Package run orchestrates the lifecycle of a single task — from dispatch
 // through heartbeat to completion or timeout. It wires together the north
-// client, dispatch module, and store to implement the task arrival flow
-// described in DETAIL-DESIGN §4.2.
+// resolver, dispatch module, shared slots pool, and store to implement the
+// task arrival flow.
 package run
 
 import (
@@ -14,47 +14,53 @@ import (
 	"git.0x0f.dev/forgery/internal/config"
 	"git.0x0f.dev/forgery/internal/dispatch"
 	"git.0x0f.dev/forgery/internal/north"
+	"git.0x0f.dev/forgery/internal/slots"
 	"git.0x0f.dev/forgery/internal/store"
 )
-
-// northClient is the subset of north.Client methods that the run module uses.
-// Using an interface allows mocking in tests.
-//
-// See also: internal/south/handler.go's northForwarder interface.
-// Both interfaces describe overlapping subsets of the same north.Client type.
-type northClient interface {
-	ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error)
-	ReleaseSlot()
-	StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx)
-}
 
 // taskDispatcher is the subset of dispatch.Dispatcher methods that the run
 // module uses.
 type taskDispatcher interface {
-	Trigger(ctx context.Context, taskCtx *store.TaskCtx) error
+	Trigger(ctx context.Context, taskCtx *store.TaskCtx, inst config.Instance) error
+}
+
+// sessionRemover is the subset of session.Manager that the run module needs:
+// dropping a runner's session when the task fails or times out before
+// reaching a terminal state. session does not import run, so wiring the
+// concrete *session.Manager here creates no import cycle. The empty string
+// is safe to pass — Remove is idempotent.
+type sessionRemover interface {
+	Remove(sessionToken string)
 }
 
 // Runner orchestrates the lifecycle of a single task. It holds references to
 // the subsystems needed to dispatch a task to GitHub Actions, maintain a
 // heartbeat with Forgejo while waiting for the internal runner to connect,
 // and clean up when the task reaches a terminal state or times out.
+//
+// Every task is routed through the north.Resolver: the TaskCtx.Instance
+// field selects both the instance configuration (GA startup timeout) and the
+// northbound client (heartbeat, failure reporting) that owns the task.
 type Runner struct {
-	north    northClient
+	pool     *slots.Pool // daemon-wide backpressure pool (shared with pollers)
 	dispatch taskDispatcher
 	store    store.TaskStore
-	cfg      *config.Config
+	resolver north.Resolver
+	sessions sessionRemover // drops runner sessions on failure/timeout paths
 	log      *slog.Logger
 }
 
-// New creates a Runner with the required dependencies. The north and dispatch
-// parameters accept concrete types (*north.Client and *dispatch.Dispatcher)
-// which satisfy the internal northClient and taskDispatcher interfaces.
-func New(cfg *config.Config, nc *north.Client, dp *dispatch.Dispatcher, st store.TaskStore, log *slog.Logger) *Runner {
+// New creates a Runner with the required dependencies. The dispatch
+// parameter accepts the concrete *dispatch.Dispatcher, which satisfies the
+// internal taskDispatcher interface; sessions accepts the concrete
+// *session.Manager, which satisfies the internal sessionRemover interface.
+func New(pool *slots.Pool, dp *dispatch.Dispatcher, st store.TaskStore, resolver north.Resolver, sessions sessionRemover, log *slog.Logger) *Runner {
 	return &Runner{
-		north:    nc,
+		pool:     pool,
 		dispatch: dp,
 		store:    st,
-		cfg:      cfg,
+		resolver: resolver,
+		sessions: sessions,
 		log:      log,
 	}
 }
@@ -72,24 +78,47 @@ func failureUpdateRequest(taskID int64) *v1.UpdateTaskRequest {
 // HandleTask orchestrates the lifecycle of a single task.
 //
 // Flow:
-//  1. Dispatch to GitHub Actions via workflow_dispatch API.
-//  2. On success: mark dispatched, start heartbeat, wait for completion/timeout.
-//  3. On failure: report failure to Forgejo, release slot, return.
-//  4. On completion (done signal from internal runner): stop heartbeat, release slot.
-//  5. On GA_STARTUP_TIMEOUT: report failure, stop heartbeat, release slot, remove from store.
-//  6. On context cancellation: graceful stop of heartbeat, release slot.
+//  1. Resolve the owning instance (config + northbound client) by name.
+//  2. Dispatch to GitHub Actions via workflow_dispatch API.
+//  3. On success: mark dispatched, start heartbeat, wait for completion/timeout.
+//  4. On failure: report failure to Forgejo, drop any session, release slot, return.
+//  5. On completion (done signal from internal runner): stop heartbeat, release slot.
+//  6. On GA_STARTUP_TIMEOUT: report failure, stop heartbeat, drop session, release slot, remove from store.
+//  7. On context cancellation: graceful stop of heartbeat, release slot.
 func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
-	r.log.Info("handling task", "task_id", taskCtx.ID)
+	r.log.Info("handling task", "task_id", taskCtx.ID, "instance", taskCtx.Instance)
+
+	// Step 0: Resolve the owning instance. A failure here is a routing
+	// inconsistency (config validation guarantees every task's instance
+	// exists), so this is a defensive path: there is no client to report
+	// to, so log, drop the task, and release the slot.
+	inst, client, ok := r.resolver.Resolve(taskCtx.Instance)
+	if !ok {
+		r.log.Error("task references unknown instance, dropping",
+			"task_id", taskCtx.ID, "instance", taskCtx.Instance)
+		r.store.Remove(taskCtx.ID)
+		// Defensive: no session can exist for an unresolvable instance
+		// (Register fails before creating one), but removing is idempotent
+		// and keeps the invariant that this exit path leaves no session.
+		r.sessions.Remove(taskCtx.SessionToken)
+		r.pool.Release()
+		return
+	}
 
 	// Step 1: Dispatch to GitHub Actions.
-	if err := r.dispatch.Trigger(ctx, taskCtx); err != nil {
+	if err := r.dispatch.Trigger(ctx, taskCtx, inst); err != nil {
 		r.log.Error("dispatch failed", "task_id", taskCtx.ID, "err", err)
 
 		// Report failure to Forgejo.
-		r.north.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
+		client.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
+
+		// Drop any session bound to this task (normally none yet — the
+		// runner cannot register before dispatch succeeds — but a race
+		// with one-job auto-registration makes this possible).
+		r.sessions.Remove(taskCtx.SessionToken)
 
 		// Release backpressure slot.
-		r.north.ReleaseSlot()
+		r.pool.Release()
 
 		// Remove from store so it doesn't leak as a pending task.
 		r.store.Remove(taskCtx.ID)
@@ -103,10 +132,11 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 	// waiting for the internal runner to connect.
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
-	go r.north.StartHeartbeat(hbCtx, taskCtx)
+	go client.StartHeartbeat(hbCtx, taskCtx)
 
 	// Step 4: Wait for completion, timeout, or global shutdown.
-	timeout := time.After(r.cfg.GAStartupTimeout)
+	// The timeout is the owning instance's GAStartupTimeout.
+	timeout := time.After(inst.GAStartupTimeout)
 
 	select {
 	case <-taskCtx.Done():
@@ -115,7 +145,7 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		// and removed the task from the store.
 		r.log.Info("task completed by internal runner", "task_id", taskCtx.ID)
 		hbCancel()
-		r.north.ReleaseSlot()
+		r.pool.Release()
 
 	case <-timeout:
 		// GA_STARTUP_TIMEOUT expired — the internal runner never connected.
@@ -125,10 +155,17 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		hbCancel()
 
 		// Report failure to Forgejo.
-		r.north.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
+		client.ForwardUpdateTask(ctx, failureUpdateRequest(taskCtx.ID))
+
+		// Drop the runner's session if one was created before the timeout
+		// (the runner registered but never reported a terminal state).
+		// Without this, the session and its Running task would leak:
+		// store.GC only reaps Pending/Terminal tasks. The app GC loop's
+		// Expire pass is the backstop for any session this misses.
+		r.sessions.Remove(taskCtx.SessionToken)
 
 		// Clean up.
-		r.north.ReleaseSlot()
+		r.pool.Release()
 		r.store.Remove(taskCtx.ID)
 
 	case <-ctx.Done():
@@ -137,6 +174,6 @@ func (r *Runner) HandleTask(ctx context.Context, taskCtx *store.TaskCtx) {
 		// runner disconnects.
 		r.log.Warn("task handling interrupted by shutdown", "task_id", taskCtx.ID)
 		hbCancel()
-		r.north.ReleaseSlot()
+		r.pool.Release()
 	}
 }

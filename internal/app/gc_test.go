@@ -1,0 +1,244 @@
+package app
+
+import (
+	"context"
+	"log/slog"
+	"testing"
+	"time"
+
+	"git.0x0f.dev/forgery/internal/config"
+	"git.0x0f.dev/forgery/internal/session"
+	"git.0x0f.dev/forgery/internal/store"
+)
+
+// ── helpers ──
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
+
+// newGCTask builds a TaskCtx in the given status with a controlled age.
+func newGCTask(id int64, instance, regToken string, age time.Duration, status store.TaskStatus) *store.TaskCtx {
+	tc := &store.TaskCtx{
+		ID:        id,
+		Instance:  instance,
+		RegToken:  regToken,
+		CreatedAt: time.Now().Add(-age),
+	}
+	tc.SetStatus(status)
+	return tc
+}
+
+// newOrphanedSession registers a session for a task and backdates it past maxAge.
+func newOrphanedSession(m *session.Manager, taskCtx *store.TaskCtx, age time.Duration) *session.Session {
+	s := m.CreateWithToken(taskCtx, "sess-"+string(rune('a'+taskCtx.ID)), "runner", nil)
+	s.CreatedAt = time.Now().Add(-age)
+	return s
+}
+
+func cfgWithTimeouts(instances ...time.Duration) *config.Config {
+	cfg := &config.Config{}
+	for i, t := range instances {
+		cfg.Instances = append(cfg.Instances, config.Instance{
+			Name:             string(rune('a' + i)),
+			GAStartupTimeout: t,
+		})
+	}
+	return cfg
+}
+
+// ── gcOnce ──
+
+// TestGCOnce_ExpiredPendingCleared verifies the store GC pass reaps an
+// expired Pending task (the wiring that production previously lacked).
+func TestGCOnce_ExpiredPendingCleared(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+
+	expired := newGCTask(1, "inst-a", "reg-1", 16*time.Minute, store.StatusPending)
+	fresh := newGCTask(2, "inst-a", "reg-2", time.Minute, store.StatusPending)
+	st.PutPending(expired)
+	st.PutPending(fresh)
+
+	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+
+	if _, ok := st.GetByID(1); ok {
+		t.Error("expired Pending task should have been removed by gcOnce")
+	}
+	if _, ok := st.GetByID(2); !ok {
+		t.Error("fresh Pending task must survive gcOnce")
+	}
+}
+
+// TestGCOnce_ExpiredSession_TerminatesAndRemovesTask verifies the session
+// expiry pass: the session is deleted, the task is removed from the store,
+// and MarkDone closes the task's Done channel (which releases the
+// backpressure slot if HandleTask is still waiting on it).
+func TestGCOnce_ExpiredSession_TerminatesAndRemovesTask(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+
+	taskCtx := newGCTask(7, "inst-a", "reg-7", time.Hour, store.StatusRunning)
+	st.PutPending(taskCtx)
+	s := newOrphanedSession(m, taskCtx, 2*time.Hour)
+
+	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+
+	// Session deleted.
+	if _, ok := m.Lookup(s.SessionToken); ok {
+		t.Error("expired session should have been removed")
+	}
+	// Task removed from store.
+	if _, ok := st.GetByID(7); ok {
+		t.Error("task of expired session should have been removed")
+	}
+	// Task forced terminal: Done channel closed.
+	select {
+	case <-taskCtx.Done():
+		// OK
+	default:
+		t.Error("task Done channel should be closed after session expiry")
+	}
+}
+
+// TestGCOnce_ExpiredSession_AlreadyRemovedTask verifies the race where the
+// task was already removed (e.g. HandleTask timed out) while the session is
+// still registered: gcOnce must not panic and must clean the session.
+func TestGCOnce_ExpiredSession_AlreadyRemovedTask(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+
+	taskCtx := newGCTask(8, "inst-a", "reg-8", time.Hour, store.StatusRunning)
+	s := newOrphanedSession(m, taskCtx, 2*time.Hour)
+	st.Remove(taskCtx.ID) // task gone, session orphaned
+
+	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+
+	if _, ok := m.Lookup(s.SessionToken); ok {
+		t.Error("orphaned session should have been removed")
+	}
+	// Done must still be closed so a still-waiting HandleTask releases its slot.
+	select {
+	case <-taskCtx.Done():
+		// OK
+	default:
+		t.Error("task Done channel should be closed after session expiry")
+	}
+}
+
+// TestGCOnce_KeepsFreshSessionAndTask verifies the pass is a no-op for
+// healthy state.
+func TestGCOnce_KeepsFreshSessionAndTask(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+
+	taskCtx := newGCTask(9, "inst-a", "reg-9", time.Minute, store.StatusRunning)
+	st.PutPending(taskCtx)
+	s := m.CreateWithToken(taskCtx, "sess-fresh", "runner", nil) // fresh: now
+
+	gcOnce(time.Now(), st, m, time.Hour, testLogger())
+
+	if _, ok := m.Lookup(s.SessionToken); !ok {
+		t.Error("fresh session must survive gcOnce")
+	}
+	if _, ok := st.GetByID(9); !ok {
+		t.Error("fresh running task must survive gcOnce")
+	}
+}
+
+// TestGCOnce_Empty verifies the pass is safe on empty state.
+func TestGCOnce_Empty(t *testing.T) {
+	gcOnce(time.Now(), store.NewMemStore(), session.NewManager(), time.Hour, testLogger())
+}
+
+// ── sessionMaxAge ──
+
+func TestSessionMaxAge_TwiceLargestTimeout(t *testing.T) {
+	cfg := cfgWithTimeouts(10*time.Minute, 15*time.Minute, 5*time.Minute)
+	if got := sessionMaxAge(cfg); got != 30*time.Minute {
+		t.Fatalf("sessionMaxAge = %v, want 30m", got)
+	}
+}
+
+func TestSessionMaxAge_SingleInstance(t *testing.T) {
+	cfg := cfgWithTimeouts(7 * time.Minute)
+	if got := sessionMaxAge(cfg); got != 14*time.Minute {
+		t.Fatalf("sessionMaxAge = %v, want 14m", got)
+	}
+}
+
+// ── gcLoop ──
+
+// TestGCLoop_TicksAndCleans verifies the interval parameter takes effect:
+// with a short interval the loop reaps an expired session within a few
+// ticks, and it exits promptly on context cancellation.
+func TestGCLoop_TicksAndCleans(t *testing.T) {
+	st := store.NewMemStore()
+	m := session.NewManager()
+
+	taskCtx := newGCTask(21, "inst-a", "reg-21", time.Hour, store.StatusRunning)
+	st.PutPending(taskCtx)
+	newOrphanedSession(m, taskCtx, 2*time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		gcLoop(ctx, 10*time.Millisecond, st, m, time.Hour, testLogger())
+		close(done)
+	}()
+
+	// The session must be reaped shortly after the first tick.
+	deadline := time.After(2 * time.Second)
+	for {
+		if _, ok := m.Lookup("sess-" + string(rune('a'+21))); !ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("gcLoop did not reap the expired session within 2s")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// Cancel: the loop must exit and not block.
+	cancel()
+	select {
+	case <-done:
+		// OK
+	case <-time.After(2 * time.Second):
+		t.Fatal("gcLoop did not exit after context cancellation")
+	}
+}
+
+// TestGCLoop_AlreadyCancelled verifies the loop returns immediately when the
+// context is already cancelled (does not block graceful shutdown).
+func TestGCLoop_AlreadyCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		gcLoop(ctx, time.Millisecond, store.NewMemStore(), session.NewManager(), time.Hour, testLogger())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// OK
+	case <-time.After(2 * time.Second):
+		t.Fatal("gcLoop blocked on an already-cancelled context")
+	}
+}
+
+// TestTokenPrefix verifies the safe-logging truncation helper.
+func TestTokenPrefix(t *testing.T) {
+	if got := tokenPrefix("0123456789abcdef"); got != "01234567" {
+		t.Errorf("tokenPrefix(long) = %q, want 8 chars", got)
+	}
+	if got := tokenPrefix("abc"); got != "abc" {
+		t.Errorf("tokenPrefix(short) = %q, want unchanged", got)
+	}
+	if got := tokenPrefix(""); got != "" {
+		t.Errorf("tokenPrefix(empty) = %q, want empty", got)
+	}
+}

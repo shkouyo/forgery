@@ -22,25 +22,58 @@ import (
 	"git.0x0f.dev/forgery/internal/version"
 )
 
+// Tunables for workflow_dispatch HTTP calls and retry handling.
+const (
+	// httpClientTimeout bounds every HTTP request to the GitHub Actions API.
+	httpClientTimeout = 30 * time.Second
+
+	// errorBodyLimit caps how many bytes of a non-204 response body are
+	// read for error diagnostics (1 KiB is plenty for an API error).
+	errorBodyLimit = 1024
+
+	// defaultMaxRetries is the retry count for server (5xx) and network
+	// errors applied by NewDispatcher; client errors (4xx) never retry.
+	defaultMaxRetries = 3
+
+	// initialBackoff is the first retry delay; each retry doubles it,
+	// with ±25% jitter applied.
+	initialBackoff = 1 * time.Second
+)
+
+// GitHub holds the daemon-wide GitHub Actions connection settings used for
+// workflow_dispatch. It is a decoupled subset of config.Global: dispatch
+// never sees the full configuration, only these fields.
+type GitHub struct {
+	Token      string // github_token (required)
+	Repo       string // github_repo "owner/repo" (required)
+	WorkflowID string // github_workflow_id (required)
+	Ref        string // github_ref (default: "main")
+	APIURL     string // github_api_url (default: "https://api.github.com")
+	PublicURL  string // public_url, sent to the workflow as proxy_url
+}
+
 // Dispatcher sends workflow_dispatch requests to the GitHub Actions API
 // to trigger execution of a forgejo-runner inside a GitHub Actions Workflow.
 type Dispatcher struct {
-	client     *http.Client // Timeout: 30s
-	cfg        *config.Config
+	client     *http.Client // Timeout: httpClientTimeout
+	gh         GitHub
 	log        *slog.Logger
-	maxRetries int // default 3
+	maxRetries int // 5xx/network-error retries; NewDispatcher applies defaultMaxRetries
 }
 
-// NewDispatcher creates a Dispatcher with a 30-second HTTP client timeout
-// and the forgery/<version> User-Agent header.
-func NewDispatcher(cfg *config.Config, log *slog.Logger) *Dispatcher {
+// NewDispatcher creates a Dispatcher with the httpClientTimeout HTTP client
+// timeout and the forgery/<version> User-Agent header. gh carries the global
+// GitHub
+// Actions settings; per-instance values (labels, container image) arrive at
+// Trigger time.
+func NewDispatcher(gh GitHub, log *slog.Logger) *Dispatcher {
 	return &Dispatcher{
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: httpClientTimeout,
 		},
-		cfg:        cfg,
+		gh:         gh,
 		log:        log,
-		maxRetries: 3,
+		maxRetries: defaultMaxRetries,
 	}
 }
 
@@ -62,27 +95,30 @@ type dispatchInputs struct {
 }
 
 type dispatchInput struct {
-	ProxyURL        string `json:"proxy_url"`
-	RegToken        string `json:"reg_token"`
-	Labels          string `json:"labels"`
-	ContainerImage  string `json:"container_image"`
-	TaskID          string `json:"task_id"`
+	ProxyURL       string `json:"proxy_url"`
+	RegToken       string `json:"reg_token"`
+	Labels         string `json:"labels"`
+	ContainerImage string `json:"container_image"`
+	TaskID         string `json:"task_id"`
 }
 
 // Trigger sends a workflow_dispatch request to the GitHub API to start
-// a forgejo-runner for the given task. It retries on server errors (5xx)
-// and network errors with exponential backoff. Client errors (4xx) are
-// not retried. Context cancellation is respected.
-func (d *Dispatcher) Trigger(ctx context.Context, taskCtx *store.TaskCtx) error {
-	return d.triggerWithRetry(ctx, taskCtx, d.maxRetries)
+// a forgejo-runner for the given task on the given Forgejo instance. It
+// retries on server errors (5xx) and network errors with exponential
+// backoff. Client errors (4xx) are not retried. Context cancellation is
+// respected. inst supplies the per-instance dispatch inputs (labels,
+// container image); all GitHub connection settings come from the global
+// GitHub struct captured at construction.
+func (d *Dispatcher) Trigger(ctx context.Context, taskCtx *store.TaskCtx, inst config.Instance) error {
+	return d.triggerWithRetry(ctx, taskCtx, inst, d.maxRetries)
 }
 
 // triggerWithRetry calls dispatch with exponential backoff retry.
 // It retries up to maxRetries times on server errors (5xx) and network errors.
 // Client errors (4xx) are NOT retried.
-func (d *Dispatcher) triggerWithRetry(ctx context.Context, taskCtx *store.TaskCtx, maxRetries int) error {
+func (d *Dispatcher) triggerWithRetry(ctx context.Context, taskCtx *store.TaskCtx, inst config.Instance, maxRetries int) error {
 	var lastErr error
-	backoff := 1 * time.Second
+	backoff := initialBackoff
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -101,7 +137,7 @@ func (d *Dispatcher) triggerWithRetry(ctx context.Context, taskCtx *store.TaskCt
 			backoff *= 2
 		}
 
-		err := d.dispatch(ctx, taskCtx)
+		err := d.dispatch(ctx, taskCtx, inst)
 		if err == nil {
 			return nil
 		}
@@ -118,17 +154,19 @@ func (d *Dispatcher) triggerWithRetry(ctx context.Context, taskCtx *store.TaskCt
 }
 
 // dispatch sends a single workflow_dispatch request to the GitHub API.
-func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx) error {
+// Global connection settings come from d.gh; per-instance inputs (labels,
+// container image) come from inst.
+func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx, inst config.Instance) error {
 	url := fmt.Sprintf("%s/repos/%s/actions/workflows/%s/dispatches",
-		d.cfg.GHApiURL, d.cfg.GitHubRepo, d.cfg.GitHubWorkflowID)
+		d.gh.APIURL, d.gh.Repo, d.gh.WorkflowID)
 
 	body := dispatchInputs{
-		Ref: d.cfg.GitHubRef,
+		Ref: d.gh.Ref,
 		Inputs: dispatchInput{
-			ProxyURL:       d.cfg.PublicURL,
+			ProxyURL:       d.gh.PublicURL,
 			RegToken:       taskCtx.RegToken,
-			Labels:         strings.Join(d.cfg.ForgejoRunnerLabels, ","),
-			ContainerImage: d.cfg.DefaultContainerImage,
+			Labels:         strings.Join(inst.ForgejoRunnerLabels, ","),
+			ContainerImage: inst.DefaultContainerImage,
 			TaskID:         fmt.Sprintf("%d", taskCtx.ID),
 		},
 	}
@@ -143,7 +181,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx) error
 		return fmt.Errorf("dispatch: create request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+d.cfg.GitHubToken)
+	req.Header.Set("Authorization", "Bearer "+d.gh.Token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "forgery/"+version.Version)
 
@@ -167,8 +205,8 @@ func (d *Dispatcher) dispatch(ctx context.Context, taskCtx *store.TaskCtx) error
 		return nil
 	}
 
-	// Read up to 1KB of the response body for error diagnostics.
-	limitedReader := io.LimitReader(resp.Body, 1024)
+	// Read up to errorBodyLimit (1 KiB) of the response body for diagnostics.
+	limitedReader := io.LimitReader(resp.Body, errorBodyLimit)
 	respBody, _ := io.ReadAll(limitedReader)
 
 	d.log.Error("workflow_dispatch failed",

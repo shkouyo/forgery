@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -235,5 +236,183 @@ func TestNewManager_InitializesMap(t *testing.T) {
 	_, ok := m.Lookup("anything")
 	if ok {
 		t.Fatal("expected false on empty manager")
+	}
+}
+
+// ── Expire ──
+
+// backdate sets a session's CreatedAt to force it to a known age.
+// CreatedAt is immutable in production; tests may set it directly before
+// any concurrent access begins.
+func backdate(s *Session, age time.Duration) {
+	s.CreatedAt = time.Now().Add(-age)
+}
+
+func TestExpire_RemovesExpired_KeepsFresh(t *testing.T) {
+	m := NewManager()
+
+	expired := m.Create(newTaskCtx(1, "reg-1"), "runner-a", nil)
+	fresh := m.Create(newTaskCtx(2, "reg-2"), "runner-b", nil)
+	backdate(expired, 2*time.Hour)
+
+	got := m.Expire(time.Now(), time.Hour)
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 expired session, got %d", len(got))
+	}
+	if got[0] != expired {
+		t.Fatal("Expire returned the wrong session")
+	}
+
+	// Expired session must be deleted from the manager.
+	if _, ok := m.Lookup(expired.SessionToken); ok {
+		t.Error("expired session still present after Expire")
+	}
+	// Fresh session must survive.
+	if _, ok := m.Lookup(fresh.SessionToken); !ok {
+		t.Error("fresh session removed by Expire")
+	}
+}
+
+func TestExpire_Boundary_ExactlyMaxAgeNotExpired(t *testing.T) {
+	m := NewManager()
+	s := m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
+
+	// Exactly maxAge old: strict > comparison must keep it alive.
+	const maxAge = time.Hour
+	now := time.Now()
+	s.CreatedAt = now.Add(-maxAge)
+
+	got := m.Expire(now, maxAge)
+	if len(got) != 0 {
+		t.Fatalf("session exactly maxAge old must not expire, got %d", len(got))
+	}
+	if _, ok := m.Lookup(s.SessionToken); !ok {
+		t.Fatal("session exactly maxAge old was removed")
+	}
+
+	// One nanosecond past maxAge: must expire.
+	got = m.Expire(now.Add(time.Nanosecond), maxAge)
+	if len(got) != 1 || got[0] != s {
+		t.Fatalf("session past maxAge must expire, got %d sessions", len(got))
+	}
+}
+
+func TestExpire_ReturnsAllExpiredSessions(t *testing.T) {
+	m := NewManager()
+
+	var want []*Session
+	for i := int64(1); i <= 3; i++ {
+		s := m.Create(newTaskCtx(i, fmt.Sprintf("reg-%d", i)), "runner", nil)
+		backdate(s, 2*time.Hour)
+		want = append(want, s)
+	}
+	keep := m.Create(newTaskCtx(9, "reg-9"), "runner", nil) // fresh
+
+	got := m.Expire(time.Now(), time.Hour)
+
+	if len(got) != len(want) {
+		t.Fatalf("expected %d expired sessions, got %d", len(want), len(got))
+	}
+	// Order is unspecified — compare by session token.
+	gotTokens := make(map[string]bool, len(got))
+	for _, s := range got {
+		gotTokens[s.SessionToken] = true
+	}
+	for _, s := range want {
+		if !gotTokens[s.SessionToken] {
+			t.Errorf("expected session %q in Expire result", s.SessionToken)
+		}
+	}
+
+	// Expired sessions must be gone, the fresh one must remain.
+	for _, s := range want {
+		if _, ok := m.Lookup(s.SessionToken); ok {
+			t.Errorf("expired session %q still present", s.SessionToken)
+		}
+	}
+	if _, ok := m.Lookup(keep.SessionToken); !ok {
+		t.Error("fresh session removed by Expire")
+	}
+}
+
+func TestExpire_EmptyAndAllFresh(t *testing.T) {
+	m := NewManager()
+
+	// Empty manager: no panic, empty result.
+	if got := m.Expire(time.Now(), time.Hour); len(got) != 0 {
+		t.Fatalf("expected no expired sessions on empty manager, got %d", len(got))
+	}
+
+	// Fresh sessions: nothing expired.
+	m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
+	m.Create(newTaskCtx(2, "reg-2"), "runner", nil)
+	if got := m.Expire(time.Now(), time.Hour); len(got) != 0 {
+		t.Fatalf("expected no expired sessions, got %d", len(got))
+	}
+}
+
+func TestExpire_ZeroMaxAge(t *testing.T) {
+	m := NewManager()
+	s := m.Create(newTaskCtx(1, "reg-1"), "runner", nil)
+
+	// maxAge = 0 expires any session created strictly before now.
+	now := time.Now()
+	s.CreatedAt = now.Add(-time.Millisecond)
+
+	got := m.Expire(now, 0)
+	if len(got) != 1 || got[0] != s {
+		t.Fatalf("expected the aged session to expire with maxAge 0, got %d", len(got))
+	}
+}
+
+func TestExpire_ConcurrentWithCreateAndLookup(t *testing.T) {
+	// Run with -race: Expire must not race with Create/Lookup/Remove.
+	m := NewManager()
+
+	const n = 100
+	var wg sync.WaitGroup
+
+	// Seed sessions that will age past the expiry window.
+	for i := 0; i < 50; i++ {
+		s := m.Create(newTaskCtx(int64(i+1), "reg-seed"), "runner", nil)
+		backdate(s, 2*time.Hour)
+	}
+
+	// Workers interleave Expire with Create/Lookup/Remove.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < n; j++ {
+				s := m.Create(newTaskCtx(int64(1000+j), "reg-new"), "runner", nil)
+				_, _ = m.Lookup(s.SessionToken)
+				m.Remove(s.SessionToken)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < n; j++ {
+			_ = m.Expire(time.Now(), time.Hour)
+		}
+	}()
+
+	wg.Wait()
+
+	// Only the seeded sessions (all expired) may be gone; the fresh ones
+	// created by the workers were removed by their own Remove. The manager
+	// must still be internally consistent (no panics, no leftovers of the
+	// expired seeds).
+	for i := 0; i < 50; i++ {
+		// Can't assert presence (workers removed their own), but Lookup
+		// must not panic and Expire must not have returned nil entries.
+		for _, s := range m.Expire(time.Now(), 0) {
+			if s == nil {
+				t.Error("Expire returned a nil session")
+			}
+		}
 	}
 }

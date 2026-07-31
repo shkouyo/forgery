@@ -1,0 +1,50 @@
+# ── Forgery configuration example ──
+#
+# Copy this file to forgery.toml and fill in your values. Loaded via
+# `forgery --config forgery.toml`. Unknown keys and invalid values are
+# rejected at startup — fix typos here rather than being silently ignored.
+
+# ── Global: observability ──
+log_level = "info"            # log_level (default: "info")
+log_format = "json"           # log_format (default: "json")
+health_addr = ""              # health_addr (default: "", health checks disabled)
+
+# ── Global: forgery server ──
+listen_addr = ":8443"         # listen_addr (default: ":8443")
+# public_url = "https://forgery.example.com:8443"  # default: derived from hostname + listen_addr port
+# state_file = "/var/lib/forgery/forgery-state.json"  # default: <config dir>/forgery-state.json
+
+# ── Global: concurrency ──
+max_parallel_tasks = 5        # max_parallel_tasks (default: 5)
+
+# ── Global: GitHub Actions connection ──
+github_token = "YOUR_GITHUB_TOKEN"        # github_token (required)
+github_repo = "owner/repo"                # github_repo "owner/repo" (required)
+github_workflow_id = "forgery-runner.yml" # github_workflow_id (required)
+github_ref = "main"                       # github_ref (default: "main")
+github_api_url = "https://api.github.com" # github_api_url (default: "https://api.github.com")
+
+# ── Instances: Forgejo connections ──
+#
+# One [[instances]] entry per Forgejo connection. Every instance is
+# registered as its own Forgejo Runner and polled for tasks.
+
+[[instances]]
+# ── Forgejo connection ──
+# name = "my-forgejo"            # name (default: host of forgejo_url)
+forgejo_url = "https://forgejo.example.com"   # forgejo_url (required)
+forgejo_runner_token = "YOUR_RUNNER_TOKEN"    # forgejo_runner_token (required)
+forgejo_runner_name = "forgery"               # forgejo_runner_name (default: "forgery")
+forgejo_runner_labels = "ubuntu-latest:docker://node:20,docker:docker://catthehacker/ubuntu:act-latest" # forgejo_runner_labels (required, comma-separated)
+
+# ── Container ──
+default_container_image = ""  # default_container_image (default: "")
+
+# ── Concurrency & timeouts ──
+poll_interval = "3s"       # poll_interval (default: "3s")
+reg_token_ttl = "15m"      # reg_token_ttl (default: "15m")
+ga_startup_timeout = "15m" # ga_startup_timeout (default: "15m")
+heartbeat_interval = "30s" # heartbeat_interval (default: "30s")
+
+# ── TLS ──
+tls_insecure_skip_verify = false # tls_insecure_skip_verify (default: false)

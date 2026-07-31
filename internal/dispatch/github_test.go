@@ -18,17 +18,32 @@ import (
 	"git.0x0f.dev/forgery/internal/store"
 )
 
-// testCfg returns a Config with values suitable for testing.
-func testCfg(apiURL string) *config.Config {
-	return &config.Config{
-		GHApiURL:             apiURL,
-		GitHubToken:          "test-github-token",
-		GitHubRepo:           "test-owner/test-repo",
-		GitHubWorkflowID:     "forgery-runner.yml",
-		GitHubRef:            "main",
-		PublicURL:            "https://forgery.example.com:8443",
-		ForgejoRunnerLabels:  []string{"ubuntu-latest:docker://node:20", "docker:docker://ghcr.io/test"},
-		DefaultContainerImage: "docker://ghcr.io/catthehacker/ubuntu:act-latest",
+// testGitHub returns GitHub connection settings suitable for testing.
+func testGitHub(apiURL string) GitHub {
+	return GitHub{
+		APIURL:     apiURL,
+		Token:      "test-github-token",
+		Repo:       "test-owner/test-repo",
+		WorkflowID: "forgery-runner.yml",
+		Ref:        "main",
+		PublicURL:  "https://forgery.example.com:8443",
+	}
+}
+
+// testInstances returns two instances with distinct labels and container
+// images, for routing verification.
+func testInstances() []config.Instance {
+	return []config.Instance{
+		{
+			Name:                  "inst-a",
+			ForgejoRunnerLabels:   []string{"ubuntu-latest:docker://node:20", "docker:docker://ghcr.io/test"},
+			DefaultContainerImage: "docker://ghcr.io/catthehacker/ubuntu:act-latest",
+		},
+		{
+			Name:                  "inst-b",
+			ForgejoRunnerLabels:   []string{"linux:docker://debian:bookworm"},
+			DefaultContainerImage: "docker://ghcr.io/catthehacker/debian:bookworm",
+		},
 	}
 }
 
@@ -36,6 +51,7 @@ func testCfg(apiURL string) *config.Config {
 func testTaskCtx() *store.TaskCtx {
 	return &store.TaskCtx{
 		ID:        42,
+		Instance:  "inst-a",
 		Task:      nil, // dispatch doesn't use Task field
 		RegToken:  "abc123def456",
 		CreatedAt: time.Now(),
@@ -53,10 +69,9 @@ func TestTrigger_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error for 204, got: %v", err)
 	}
@@ -81,10 +96,9 @@ func TestTrigger_DispatchError(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			cfg := testCfg(srv.URL)
-			d := NewDispatcher(cfg, nopLogger())
+			d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-			err := d.Trigger(context.Background(), testTaskCtx())
+			err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 			if err == nil {
 				t.Fatal("expected non-nil error")
 			}
@@ -141,12 +155,73 @@ func TestTrigger_RequestBodyFormat(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+// TestTrigger_PerInstanceInputs verifies the multi-instance routing contract:
+// each task's labels and container_image come from its own instance, while
+// the global GitHub fields stay fixed.
+func TestTrigger_PerInstanceInputs(t *testing.T) {
+	var mu sync.Mutex
+	labelsByInstance := map[string]string{}
+	imagesByInstance := map[string]string{}
+	var globalFields []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body dispatchInputs
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("failed to decode request body: %v", err)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mu.Lock()
+		labelsByInstance[body.Inputs.TaskID] = body.Inputs.Labels
+		imagesByInstance[body.Inputs.TaskID] = body.Inputs.ContainerImage
+		globalFields = append(globalFields, body.Ref+"/"+body.Inputs.ProxyURL)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
+	insts := testInstances()
+
+	// Task 1 belongs to inst-a, task 2 to inst-b.
+	taskA := &store.TaskCtx{ID: 1, Instance: "inst-a", RegToken: "token-a", CreatedAt: time.Now()}
+	taskB := &store.TaskCtx{ID: 2, Instance: "inst-b", RegToken: "token-b", CreatedAt: time.Now()}
+
+	if err := d.Trigger(context.Background(), taskA, insts[0]); err != nil {
+		t.Fatalf("trigger for inst-a: %v", err)
+	}
+	if err := d.Trigger(context.Background(), taskB, insts[1]); err != nil {
+		t.Fatalf("trigger for inst-b: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := labelsByInstance["1"]; got != "ubuntu-latest:docker://node:20,docker:docker://ghcr.io/test" {
+		t.Errorf("inst-a labels = %q, want its own label set", got)
+	}
+	if got := labelsByInstance["2"]; got != "linux:docker://debian:bookworm" {
+		t.Errorf("inst-b labels = %q, want its own label set", got)
+	}
+	if got := imagesByInstance["1"]; got != "docker://ghcr.io/catthehacker/ubuntu:act-latest" {
+		t.Errorf("inst-a container_image = %q, want its own image", got)
+	}
+	if got := imagesByInstance["2"]; got != "docker://ghcr.io/catthehacker/debian:bookworm" {
+		t.Errorf("inst-b container_image = %q, want its own image", got)
+	}
+	// Global fields are identical for both dispatches.
+	if len(globalFields) != 2 || globalFields[0] != globalFields[1] {
+		t.Errorf("global fields varied between instances: %v", globalFields)
+	}
+	if globalFields[0] != "main/https://forgery.example.com:8443" {
+		t.Errorf("global ref/proxy_url = %q, want fixed values", globalFields[0])
 	}
 }
 
@@ -160,10 +235,9 @@ func TestTrigger_AuthorizationHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -179,10 +253,9 @@ func TestTrigger_ContentTypeHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -198,10 +271,9 @@ func TestTrigger_UserAgentHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -215,13 +287,12 @@ func TestTrigger_ContextCancellation(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	err := d.Trigger(ctx, testTaskCtx())
+	err := d.Trigger(ctx, testTaskCtx(), testInstances()[0])
 	if err == nil {
 		t.Fatal("expected non-nil error for cancelled context")
 	}
@@ -242,10 +313,9 @@ func TestTrigger_PathConstruction(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -260,10 +330,9 @@ func TestTrigger_HTTPMethod(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
 	}
@@ -301,10 +370,9 @@ func TestTrigger_RetryOn5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error after retry on 5xx, got: %v", err)
 	}
@@ -322,10 +390,9 @@ func TestTrigger_NoRetryOn4xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err == nil {
 		t.Fatal("expected non-nil error for 4xx")
 	}
@@ -347,10 +414,9 @@ func TestTrigger_MaxRetriesExceeded(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err == nil {
 		t.Fatal("expected non-nil error after max retries")
 	}
@@ -373,8 +439,7 @@ func TestTrigger_ContextCancellationStopsRetry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -385,7 +450,7 @@ func TestTrigger_ContextCancellationStopsRetry(t *testing.T) {
 		cancel()
 	}()
 
-	err := d.Trigger(ctx, testTaskCtx())
+	err := d.Trigger(ctx, testTaskCtx(), testInstances()[0])
 	if err == nil {
 		t.Fatal("expected non-nil error from context cancellation")
 	}
@@ -406,15 +471,14 @@ func TestTrigger_RetryOnNetworkError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCfg(srv.URL)
-	d := NewDispatcher(cfg, nopLogger())
+	d := NewDispatcher(testGitHub(srv.URL), nopLogger())
 	// Inject a transport that fails the first request with a network error.
 	d.client.Transport = &failTransport{
 		failN: 1,
 		next:  http.DefaultTransport,
 	}
 
-	err := d.Trigger(context.Background(), testTaskCtx())
+	err := d.Trigger(context.Background(), testTaskCtx(), testInstances()[0])
 	if err != nil {
 		t.Fatalf("expected nil error after retry on network error, got: %v", err)
 	}
@@ -432,9 +496,9 @@ func TestDispatchError_Error(t *testing.T) {
 }
 
 func TestNewDispatcher(t *testing.T) {
-	cfg := testCfg("https://api.github.com")
+	gh := testGitHub("https://api.github.com")
 	log := nopLogger()
-	d := NewDispatcher(cfg, log)
+	d := NewDispatcher(gh, log)
 
 	if d.client == nil {
 		t.Fatal("client must not be nil")
@@ -442,8 +506,8 @@ func TestNewDispatcher(t *testing.T) {
 	if d.client.Timeout != 30*time.Second {
 		t.Fatalf("expected client timeout 30s, got: %v", d.client.Timeout)
 	}
-	if d.cfg != cfg {
-		t.Fatal("cfg field not set correctly")
+	if d.gh != gh {
+		t.Fatal("gh field not set correctly")
 	}
 	if d.log != log {
 		t.Fatal("log field not set correctly")

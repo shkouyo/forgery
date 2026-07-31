@@ -40,6 +40,7 @@ var ErrTokenNotFound = errors.New("store: registration token not found")
 type TaskCtx struct {
 	// Immutable fields — set once at creation, never modified.
 	ID        int64
+	Instance  string   // Name of the owning Forgejo instance (routing key)
 	Task      *v1.Task // Complete Forgejo Task (contains secrets, vars, needs)
 	RegToken  string   // One-time registration token for the internal runner
 	CreatedAt time.Time
@@ -47,9 +48,9 @@ type TaskCtx struct {
 	// Mutable fields — protected by mu.
 	mu                 sync.RWMutex
 	status             TaskStatus
-	SessionToken       string    // Session token assigned after successful Register
-	DispatchedAt       time.Time // When workflow_dispatch succeeded
-	RunnerRegisteredAt time.Time // When the internal runner completed Register
+	SessionToken       string        // Session token assigned after successful Register
+	DispatchedAt       time.Time     // When workflow_dispatch succeeded
+	RunnerRegisteredAt time.Time     // When the internal runner completed Register
 	done               chan struct{} // closed when task reaches terminal state
 }
 

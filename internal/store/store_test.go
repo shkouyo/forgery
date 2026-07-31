@@ -514,6 +514,56 @@ func TestTaskCtxMarkMethods(t *testing.T) {
 	}
 }
 
+// ---- MarkDone idempotency (relied on by the app GC loop) ----
+
+// TestMarkDone_Idempotent verifies that MarkDone can be called any number of
+// times — sequentially or concurrently — without panicking, and that the done
+// channel is closed exactly once (every receiver sees it closed). The app GC
+// loop, south's terminal UpdateTask path, and run.HandleTask may all call
+// MarkDone for the same task from different goroutines.
+func TestMarkDone_Idempotent(t *testing.T) {
+	tc := newTestTask(1, "tok")
+
+	tc.MarkDone()
+	tc.MarkDone()
+	tc.MarkDone()
+
+	select {
+	case <-tc.Done():
+		// closed as expected
+	default:
+		t.Fatal("Done channel not closed after MarkDone")
+	}
+}
+
+func TestMarkDone_Concurrent(t *testing.T) {
+	tc := newTestTask(1, "tok")
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			tc.MarkDone()
+		}()
+	}
+	wg.Wait()
+
+	// Done must be closed after the concurrent MarkDone storm.
+	select {
+	case <-tc.Done():
+		// OK
+	default:
+		t.Fatal("Done channel not closed after concurrent MarkDone")
+	}
+
+	// Done() must still work (no double-close panic) and MarkDone must
+	// remain callable.
+	tc.MarkDone()
+	<-tc.Done()
+}
+
 // ---- T-STO-004: Custom TTL configuration ----
 
 func TestNewMemStore_DefaultTTLs(t *testing.T) {

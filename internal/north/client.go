@@ -2,14 +2,26 @@
 // Forgejo Actions runner, connecting to a real Forgejo instance via the
 // Connect (gRPC-over-HTTP) protocol. It handles runner registration,
 // task polling, and transparent forwarding of task status/log updates.
+//
+// The package exports two interfaces that decouple the south and run modules
+// from the concrete client:
+//
+//   - Client: the forwarding surface used by south (UpdateTask/UpdateLog
+//     relays) and run (heartbeat), implemented by the concrete *client
+//     returned from New.
+//   - Resolver: maps an instance name to its configuration and Client.
+//     The implementation lives in internal/app; south and run depend only
+//     on this interface and never import app.
 package north
 
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	v1 "code.gitea.io/actions-proto-go/runner/v1"
@@ -17,24 +29,66 @@ import (
 	"connectrpc.com/connect"
 
 	"git.0x0f.dev/forgery/internal/config"
+	"git.0x0f.dev/forgery/internal/state"
 	"git.0x0f.dev/forgery/internal/store"
 	"git.0x0f.dev/forgery/internal/version"
 )
 
-// Client is the northbound client that connects to the real Forgejo instance.
+// defaultHeartbeatInterval is the heartbeat tick used when an instance has
+// no heartbeat_interval configured; it mirrors the config package default.
+const defaultHeartbeatInterval = 30 * time.Second
+
+// Client is the northbound forwarding surface shared by the south and run
+// modules. It is implemented by the concrete *client returned from New.
+type Client interface {
+	// ForwardUpdateTask relays an UpdateTask request from the internal
+	// runner (southbound) to the real Forgejo instance (northbound).
+	ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error)
+	// ForwardUpdateLog relays an UpdateLog request from the internal runner
+	// to the real Forgejo instance.
+	ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error)
+	// StartHeartbeat keeps the task alive with Forgejo until ctx is
+	// cancelled (task completion, GA startup timeout, or shutdown).
+	StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx)
+}
+
+// Resolver maps an instance name to its configuration and northbound client.
+// The concrete implementation is assembled by internal/app before any
+// goroutine starts; south and run use it to route every task to the Forgejo
+// instance that owns it.
+type Resolver interface {
+	// Resolve returns the instance configuration and client registered
+	// under name. The second return value is false when no instance with
+	// that name exists (defensive path — config validation guarantees
+	// every TaskCtx.Instance matches a configured instance).
+	Resolve(name string) (config.Instance, Client, bool)
+}
+
+// client is the northbound client that connects to a real Forgejo instance.
 // It registers as an Actions runner, polls for tasks, and forwards
 // status/log updates from the internal runner back to Forgejo.
-type Client struct {
+//
+// The runner identity (UUID + permanent token) is held in memory and
+// persisted through a state.Store keyed by the instance's forgejo_url, so a
+// restart reuses the same runner instead of registering a fresh orphan.
+type client struct {
 	client      runnerv1connect.RunnerServiceClient
 	runnerUUID  string // set from Register response, sent as x-runner-uuid header
 	runnerToken string // permanent runner token from Register response, sent as x-runner-token header
-	cfg         *config.Config
+	inst        config.Instance
+	identities  state.Store
 	store       store.TaskStore
-	sem         chan struct{} // backpressure semaphore
-	log         *slog.Logger
+	log         *slog.Logger // carries the "instance" attribute for multi-instance logs
+
+	idMu  sync.Mutex // guards runnerUUID/runnerToken
+	regMu sync.Mutex // serializes re-registration in retryOnAuth
 }
 
-// New creates a new northbound Client.
+// Compile-time assertion: the concrete client implements the exported
+// Client interface.
+var _ Client = (*client)(nil)
+
+// New creates a northbound client for a single Forgejo instance.
 //
 // It constructs a net/http.Client with HTTP/2 support (required for gRPC)
 // and wraps it with the Connect-generated RunnerServiceClient configured
@@ -42,11 +96,27 @@ type Client struct {
 // x-runner-token, x-runner-version, and x-runner-uuid (once registered)
 // into every outgoing request. The base URL has /api/actions appended because
 // Forgejo mounts the runner service at that path prefix.
-// maxParallel controls the backpressure semaphore capacity.
-func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logger) *Client {
+//
+// identities is the identity store shared across instances; the persisted
+// identity for inst.ForgejoURL is loaded up front so a restart picks up
+// where the last run left off. A corrupt state file is a hard error: the
+// daemon fails fast instead of silently registering a fresh (orphan) runner.
+//
+// The logger is decorated with the instance name so multi-instance logs can
+// be told apart. Backpressure is NOT part of the client: the shared slots
+// pool is passed to PollLoop by the assembler (internal/app).
+func New(inst config.Instance, taskStore store.TaskStore, identities state.Store, log *slog.Logger) (*client, error) {
+	if identities == nil {
+		return nil, fmt.Errorf("north: nil identity store")
+	}
+
+	// Decorate the logger with the instance dimension up front so every log
+	// line emitted by this client identifies its Forgejo instance.
+	log = log.With("instance", inst.Name)
+
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
 	baseTransport.TLSClientConfig = &tls.Config{
-		InsecureSkipVerify: cfg.TLSInsecureSkipVerify, // #nosec G402
+		InsecureSkipVerify: inst.TLSInsecureSkipVerify, // #nosec G402
 	}
 	// Enable HTTP/2 over cleartext (h2c) for non-TLS endpoints (tests, dev).
 	// Production TLS connections negotiate HTTP/2 via ALPN automatically.
@@ -59,35 +129,53 @@ func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logge
 
 	httpClient := &http.Client{Transport: baseTransport}
 
-	c := &Client{
-		cfg:   cfg,
-		store: s,
-		sem:   make(chan struct{}, maxParallel),
-		log:   log,
+	c := &client{
+		inst:       inst,
+		identities: identities,
+		store:      taskStore,
+		log:        log,
+	}
+
+	// Restore the persisted identity (if any) before any RPC is sent, so
+	// startup can skip Register and reuse the same runner on Forgejo.
+	if id, ok, err := identities.Load(inst.ForgejoURL); err != nil {
+		return nil, fmt.Errorf("north: load identity: %w", err)
+	} else if ok {
+		c.setIdentity(id.UUID, id.Token)
+		c.log.Info("runner identity restored", "forgejo_url", inst.ForgejoURL)
 	}
 
 	// Auth interceptor injects runner token and version into every request.
 	// Once Register completes, the runner UUID (from the response) is also
-	// included. The closure captures c so it always reads the latest UUID.
+	// included. The closure captures c so it always reads the latest values.
+	//
+	// Register is always authenticated with the registration token, never
+	// with the (possibly stale) permanent token — that is the recovery path
+	// when the permanent token has been revoked.
 	authInterceptor := connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
 		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			// Use the permanent runner token from Register if available,
-			// otherwise fall back to the registration token (needed for Register itself).
-			if c.runnerToken != "" {
-				req.Header().Set("x-runner-token", c.runnerToken)
-			} else {
-				req.Header().Set("x-runner-token", cfg.ForgejoRunnerToken)
-			}
 			req.Header().Set("x-runner-version", version.Version)
-			if c.runnerUUID != "" {
-				req.Header().Set("x-runner-uuid", c.runnerUUID)
+			if strings.HasSuffix(req.Spec().Procedure, "/Register") {
+				req.Header().Set("x-runner-token", c.inst.ForgejoRunnerToken)
+				return next(ctx, req)
+			}
+			// Use the permanent runner token from Register if available,
+			// otherwise fall back to the registration token.
+			uuid, token := c.currentIdentity()
+			if token != "" {
+				req.Header().Set("x-runner-token", token)
+			} else {
+				req.Header().Set("x-runner-token", c.inst.ForgejoRunnerToken)
+			}
+			if uuid != "" {
+				req.Header().Set("x-runner-uuid", uuid)
 			}
 			return next(ctx, req)
 		})
 	})
 
 	// Forgejo mounts the runner gRPC service at /api/actions/.
-	runnerURL := cfg.ForgejoURL + "/api/actions"
+	runnerURL := inst.ForgejoURL + "/api/actions"
 	c.client = runnerv1connect.NewRunnerServiceClient(
 		httpClient,
 		runnerURL,
@@ -95,7 +183,7 @@ func New(cfg *config.Config, s store.TaskStore, maxParallel int, log *slog.Logge
 		connect.WithInterceptors(authInterceptor),
 	)
 
-	return c
+	return c, nil
 }
 
 // stripContainerMapping removes the container image mapping suffix
@@ -113,49 +201,64 @@ func stripContainerMapping(labels []string) []string {
 	return out
 }
 
-// Register calls the Forgejo Register RPC with the configured runner
-// token, name, labels, and version. It must be called once at startup
+// Register calls the Forgejo Register RPC with the configured registration
+// token, name, labels, and version, then persists the issued identity.
+// It must be called once at startup when no persisted identity exists,
 // before Declare or FetchTask.
 //
-// On success the runner UUID from the response is saved and will be
-// included as the x-runner-uuid header in all subsequent requests.
-func (c *Client) Register(ctx context.Context) error {
+// On success the runner UUID and permanent token from the response are
+// saved to the identity store and used as the x-runner-uuid / x-runner-token
+// headers of all subsequent requests. Register never triggers the
+// auth-fallback re-registration — it IS the recovery path.
+func (c *client) Register(ctx context.Context) error {
 	req := connect.NewRequest(&v1.RegisterRequest{
-		Token:   c.cfg.ForgejoRunnerToken,
-		Name:    c.cfg.ForgejoRunnerName,
-		Labels:  stripContainerMapping(c.cfg.ForgejoRunnerLabels),
+		Token:   c.inst.ForgejoRunnerToken,
+		Name:    c.inst.ForgejoRunnerName,
+		Labels:  stripContainerMapping(c.inst.ForgejoRunnerLabels),
 		Version: version.Version,
 	})
 	resp, err := c.client.Register(ctx, req)
 	if err != nil {
 		return err
 	}
-	// Save runner UUID and permanent token for subsequent request headers.
-	if runner := resp.Msg.GetRunner(); runner != nil {
-		c.runnerUUID = runner.GetUuid()
-		c.runnerToken = runner.GetToken()
+	runner := resp.Msg.GetRunner()
+	if runner == nil {
+		return fmt.Errorf("register: response missing runner")
 	}
+	// Save runner UUID and permanent token for subsequent request headers.
+	c.setIdentity(runner.GetUuid(), runner.GetToken())
+	// Persist the identity so future starts reuse the same runner.
+	if err := c.identities.Save(c.inst.ForgejoURL, state.Identity{UUID: runner.GetUuid(), Token: runner.GetToken()}); err != nil {
+		return fmt.Errorf("register: persist identity: %w", err)
+	}
+	c.log.Info("runner registered", "runner_uuid", runner.GetUuid())
 	return nil
 }
 
 // Declare announces the runner's labels and version to Forgejo.
 // It must be called after a successful Register and before polling
 // for tasks.
-func (c *Client) Declare(ctx context.Context) error {
-	req := connect.NewRequest(&v1.DeclareRequest{
-		Labels:  stripContainerMapping(c.cfg.ForgejoRunnerLabels),
-		Version: version.Version,
+func (c *client) Declare(ctx context.Context) error {
+	return c.retryOnAuth(ctx, func(ctx context.Context) error {
+		_, err := c.client.Declare(ctx, connect.NewRequest(&v1.DeclareRequest{
+			Labels:  stripContainerMapping(c.inst.ForgejoRunnerLabels),
+			Version: version.Version,
+		}))
+		return err
 	})
-	_, err := c.client.Declare(ctx, req)
-	return err
 }
 
 // ForwardUpdateTask transparently relays an UpdateTask request from the
 // internal runner (southbound) to the real Forgejo instance (northbound).
 // The request payload is passed through unchanged because task IDs are
 // the real Forgejo task IDs.
-func (c *Client) ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error) {
-	resp, err := c.client.UpdateTask(ctx, connect.NewRequest(req))
+func (c *client) ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskRequest) (*v1.UpdateTaskResponse, error) {
+	var resp *connect.Response[v1.UpdateTaskResponse]
+	err := c.retryOnAuth(ctx, func(ctx context.Context) error {
+		var err error
+		resp, err = c.client.UpdateTask(ctx, connect.NewRequest(req))
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -165,22 +268,17 @@ func (c *Client) ForwardUpdateTask(ctx context.Context, req *v1.UpdateTaskReques
 // ForwardUpdateLog transparently relays an UpdateLog request from the
 // internal runner to the real Forgejo instance. As with ForwardUpdateTask,
 // the payload is passed through unchanged.
-func (c *Client) ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error) {
-	resp, err := c.client.UpdateLog(ctx, connect.NewRequest(req))
+func (c *client) ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest) (*v1.UpdateLogResponse, error) {
+	var resp *connect.Response[v1.UpdateLogResponse]
+	err := c.retryOnAuth(ctx, func(ctx context.Context) error {
+		var err error
+		resp, err = c.client.UpdateLog(ctx, connect.NewRequest(req))
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
 	return resp.Msg, nil
-}
-
-// ReleaseSlot releases one backpressure slot. It must be called by the
-// run module when a task reaches a terminal state (success, failure, or
-// cancelled). The slot was acquired in PollLoop when the task was fetched.
-func (c *Client) ReleaseSlot() {
-	select {
-	case <-c.sem:
-	default:
-	}
 }
 
 // StartHeartbeat sends periodic UpdateTask(state=running) calls to Forgejo
@@ -188,17 +286,17 @@ func (c *Client) ReleaseSlot() {
 // marking the task as stalled during the window between a successful
 // workflow_dispatch and the internal runner connecting to pick up the task.
 //
-// The heartbeat uses cfg.HeartbeatInterval as the tick period. Errors are
+// The heartbeat uses inst.HeartbeatInterval as the tick period. Errors are
 // logged but do not stop the heartbeat — Forgejo tolerates missed heartbeats
 // within a grace period.
 //
 // Callers (the run module) must cancel ctx when the internal runner
 // connects and sends its own UpdateTask, or when the GA startup timeout
 // expires.
-func (c *Client) StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx) {
-	interval := c.cfg.HeartbeatInterval
+func (c *client) StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx) {
+	interval := c.inst.HeartbeatInterval
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = defaultHeartbeatInterval
 	}
 
 	ticker := time.NewTicker(interval)
@@ -220,9 +318,87 @@ func (c *Client) StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx) {
 			c.log.Debug("heartbeat stopped", "task_id", taskCtx.ID, "reason", ctx.Err())
 			return
 		case <-ticker.C:
-			if _, err := c.client.UpdateTask(ctx, connect.NewRequest(req)); err != nil {
+			if err := c.retryOnAuth(ctx, func(ctx context.Context) error {
+				_, err := c.client.UpdateTask(ctx, connect.NewRequest(req))
+				return err
+			}); err != nil {
 				c.log.Warn("heartbeat UpdateTask failed", "task_id", taskCtx.ID, "err", err)
 			}
 		}
 	}
+}
+
+// ── identity helpers ──
+
+// HasIdentity reports whether a runner identity is currently held (either
+// restored from the identity store or set by a successful Register).
+// Callers skip Register at startup when this is true.
+func (c *client) HasIdentity() bool {
+	uuid, token := c.currentIdentity()
+	return uuid != "" && token != ""
+}
+
+// Identity returns the currently held runner identity, or the zero value
+// when no identity is set.
+func (c *client) Identity() state.Identity {
+	uuid, token := c.currentIdentity()
+	return state.Identity{UUID: uuid, Token: token}
+}
+
+// setIdentity records the runner identity for outgoing request headers.
+func (c *client) setIdentity(uuid, token string) {
+	c.idMu.Lock()
+	c.runnerUUID = uuid
+	c.runnerToken = token
+	c.idMu.Unlock()
+}
+
+// currentIdentity returns the runner identity for outgoing request headers.
+func (c *client) currentIdentity() (uuid, token string) {
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	return c.runnerUUID, c.runnerToken
+}
+
+// ── auth-fallback ──
+
+// retryOnAuth runs fn once and, if it fails with an authentication or
+// permission error, re-registers the runner once and retries fn a single
+// time. This recovers from a revoked or rotated runner token without a
+// daemon restart. Re-registration is serialized so concurrent RPC failures
+// (poller, heartbeats, forwards) trigger at most one Register at a time.
+//
+// If the re-registration itself fails, or the retry fails again, the error
+// is returned unchanged in spirit — callers log it and retry on the next
+// poll cycle.
+func (c *client) retryOnAuth(ctx context.Context, fn func(context.Context) error) error {
+	err := fn(ctx)
+	if err == nil || !isAuthError(err) {
+		return err
+	}
+
+	c.log.Warn("RPC rejected by Forgejo, re-registering runner", "err", err)
+	c.regMu.Lock()
+	regErr := c.Register(ctx)
+	c.regMu.Unlock()
+	if regErr != nil {
+		return fmt.Errorf("re-register after auth failure (%v): %w", err, regErr)
+	}
+	c.log.Info("runner re-registered after auth failure")
+	return fn(ctx)
+}
+
+// isAuthError reports whether err is an Unauthenticated or PermissionDenied
+// connect error — the signals Forgejo sends when the runner token is
+// rejected. Register itself is exempt from this check because it never goes
+// through retryOnAuth.
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch connect.CodeOf(err) {
+	case connect.CodeUnauthenticated, connect.CodePermissionDenied:
+		return true
+	}
+	return false
 }
