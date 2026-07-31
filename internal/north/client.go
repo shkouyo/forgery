@@ -35,10 +35,6 @@ import (
 	"git.0x0f.dev/forgery/internal/version"
 )
 
-// defaultHeartbeatInterval is the heartbeat tick used when an instance has
-// no heartbeat_interval configured; it mirrors the config package default.
-const defaultHeartbeatInterval = 30 * time.Second
-
 // Register failure backoff bounds. After a failed re-registration, further
 // Register attempts are gated behind an exponentially growing delay — each
 // consecutive failure doubles the wait — so a dead registration token cannot
@@ -343,12 +339,10 @@ func (c *client) ForwardUpdateLog(ctx context.Context, req *v1.UpdateLogRequest)
 // connects and sends its own UpdateTask, or when the GA startup timeout
 // expires.
 func (c *client) StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx) {
-	interval := c.inst.HeartbeatInterval
-	if interval <= 0 {
-		interval = defaultHeartbeatInterval
-	}
-
-	ticker := time.NewTicker(interval)
+	// config.applyDefaults guarantees HeartbeatInterval > 0 for every
+	// instance (default 30s; negatives rejected at validation), so
+	// time.NewTicker never sees a non-positive period.
+	ticker := time.NewTicker(c.inst.HeartbeatInterval)
 	defer ticker.Stop()
 
 	// Build the UpdateTask request once — it never changes across ticks.
@@ -359,7 +353,7 @@ func (c *client) StartHeartbeat(ctx context.Context, taskCtx *store.TaskCtx) {
 		},
 	}
 
-	c.log.Debug("heartbeat started", "task_id", taskCtx.ID, "interval", interval)
+	c.log.Debug("heartbeat started", "task_id", taskCtx.ID, "interval", c.inst.HeartbeatInterval)
 
 	for {
 		select {

@@ -35,6 +35,10 @@ func testInstance(url string) config.Instance {
 		ForgejoURL:         url,
 		ForgejoRunnerToken: "reg-token",
 		ForgejoRunnerName:  "forgery",
+		// Explicit heartbeat interval: the north client now uses
+		// inst.HeartbeatInterval as-is, relying on config.applyDefaults
+		// to guarantee a positive value in production.
+		HeartbeatInterval: 30 * time.Second,
 	}
 }
 
