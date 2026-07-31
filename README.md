@@ -15,7 +15,7 @@ A single Forgery process can serve multiple Forgejo instances at once: each inst
 **1. Clone and build**
 
 ```sh
-git clone https://git.0x0f.dev/forgery
+git clone https://git.0x0f.dev/shkouyo/forgery
 cd forgery
 go build ./cmd/forgery
 ```
@@ -106,7 +106,7 @@ One `[[instances]]` entry per Forgejo connection (at least one is required):
 | `poll_interval` | No | `3s` | Interval between northbound `FetchTask` polls |
 | `reg_token_ttl` | No | `15m` | Lifetime of a one-time registration token |
 | `ga_startup_timeout` | No | `15m` | Maximum time to wait for a GA workflow to start and the internal runner to register |
-| `heartbeat_interval` | No | `30s` | Interval for sending `UpdateTask(state=running)` heartbeats while waiting for the internal runner |
+| `heartbeat_interval` | No | `30s` | Interval for sending `UpdateTask(state=running)` heartbeats, from dispatch until the task reaches a terminal state (the critical window is while waiting for the internal runner) |
 | `tls_insecure_skip_verify` | No | `false` | Skip TLS certificate verification for northbound connections (development only) |
 
 `state_file` defaults to `forgery-state.json` next to the configuration file. Forgery persists the runner identity (UUID + permanent token) of every Forgejo instance in it, keyed by `forgejo_url`, so a restart reuses the same runner instead of registering an orphan. The file is written atomically with `0600` permissions; a corrupt or wrongly versioned file is a hard error at startup — identity data is never silently discarded.
@@ -131,7 +131,7 @@ forgejo_runner_labels = "ubuntu-latest:docker://node:20-bookworm,docker:docker:/
 - When a Forgejo workflow specifies `runs-on: ubuntu-latest`, Forgery matches it and the runner executes in `node:20-bookworm`.
 - When `runs-on: docker`, it executes in `ghcr.io/catthehacker/ubuntu:act-latest`.
 
-The same label string is used for both northbound registration (so Forgejo knows which tasks to route to Forgery) and the internal runner configuration (so the GA workflow knows which container to use).
+The same label string drives both sides: northbound `Register`/`Declare` send bare label names (the `:docker://…` image mapping is stripped — Forgejo expects bare labels), while the `labels` input of the `workflow_dispatch` carries the full `label:docker://image` mapping, so the GA workflow knows which container to use.
 
 ### Health Checks
 
@@ -147,7 +147,7 @@ When `health_addr` is set, Forgery runs a health probe HTTP server on that addre
 
 **Multiple Forgejo instances** — each `[[instances]]` entry gets its own runner identity (registered against its own Forgejo) and its own task poller. Every task is tagged with its instance name; registration-token validation, heartbeats, and `UpdateTask`/`UpdateLog` forwarding are all routed through the owning instance's northbound client. The southbound side stays a single shared endpoint (`listen_addr`/`public_url` are global): the one-time registration token embedded in each `workflow_dispatch` is what maps a connecting internal runner back to its task, and therefore to its instance. `max_parallel_tasks` is one global concurrency budget shared by all instances' pollers.
 
-**Persistent runner identity** — after the first `Register`, Forgery saves the runner UUID and permanent token to the state file. On restart it reuses the same identity instead of registering a fresh orphan runner; if Forgejo rejects the permanent token (revoked or rotated), Forgery re-registers automatically and retries. Re-registration creates a **new** runner identity — the old one is gone and a new entry appears in Forgejo's runner list. Tasks that were in flight on the old identity cannot be recovered: Forgejo marks them failed automatically within roughly 10–15 minutes (its zombie-reaping cron). If the registration token itself is invalid (reset in the Forgejo UI or wrong in the config), Forgery backs off between attempts (exponential, 30s up to 5min) and logs an error pointing you at `forgejo_runner_token` or the Forgejo UI.
+**Persistent runner identity** — after the first `Register`, Forgery saves the runner UUID and permanent token to the state file. On restart it reuses the same identity instead of registering a fresh orphan runner; if Forgejo rejects the permanent token (revoked or rotated), Forgery re-registers automatically and retries. Re-registration creates a **new** runner identity — the old one is gone and a new entry appears in Forgejo's runner list. Tasks that were in flight on the old identity cannot be recovered: Forgejo marks them failed automatically within roughly 10–15 minutes (its zombie-reaping cron). If the registration token itself is invalid (reset in the Forgejo UI or wrong in the config), Forgery logs an error pointing you at `forgejo_runner_token` or the Forgejo UI and jumps straight to the 5min backoff ceiling — no retry cadence helps until the token is fixed. Transient failures (network errors, etc.), by contrast, back off exponentially between attempts, starting at 30s and doubling up to the 5min ceiling, logged at warning level.
 
 ## Build & Test
 
