@@ -147,6 +147,8 @@ forgejo_runner_labels = "ubuntu-latest:docker://node:20-bookworm,docker:docker:/
 
 **多个 Forgejo 实例** -- 每个 `[[instances]]` 条目都有独立的 Runner 身份 (分别向其自己的 Forgejo 注册) 和独立的任务 poller. 每个任务都带有所属实例 name; 注册令牌校验, 心跳, 以及 `UpdateTask`/`UpdateLog` 转发都通过所属实例的北向客户端路由. 南向保持为单一共享端点 (`listen_addr`/`public_url` 是全局配置): 每个 `workflow_dispatch` 携带的一次性注册令牌将连入的内部 runner 映射回其任务, 从而映射回所属实例. `max_parallel_tasks` 是所有实例 poller 共享的全局并发预算.
 
+**通过 Forgery 拉取代码与上传产物** -- 内部 runner 的 `GITHUB_SERVER_URL`, `GITHUB_API_URL` 和产物端点都指向 Forgery 的 `public_url` (forgejo-runner 从 `--url` 推导). Forgery 将 git 智能 HTTP 路径 (`/{owner}/{repo}` 加 git 端点), `/api/v1/repos/...` 默认分支查询和 `/api/actions_pipeline/...` 产物端点反向代理到任务所属的 Forgejo 实例, 按请求 `Authorization` 头中的任务令牌路由 -- 该令牌由 Forgejo 签发, 上游实例直接校验. 未知令牌返回 `401`; 当仅配置一个实例时, 未注册令牌回退到该实例.
+
 **持久的 Runner 身份** -- 首次 `Register` 成功后, Forgery 将 runner UUID 和永久令牌保存到 state 文件. 重启后复用同一身份, 而不会注册一个全新的孤儿 runner; 若 Forgejo 拒绝永久令牌 (被吊销或轮换), Forgery 会自动重新注册并重试. 重新注册会创建**新的** runner 身份 -- 旧身份已失效, Forgejo runner 列表中会出现新条目. 旧身份的在途任务无法恢复: Forgejo 会在大约 10-15 分钟内自动将其标记为失败 (其 zombie 清理定时任务). 若注册令牌本身无效 (在 Forgejo UI 中被重置或配置错误), Forgery 会记录指向 `forgejo_runner_token` 或 Forgejo UI 的错误日志, 并直接跳到 5min 退避上限 -- 令牌修复前, 重试节奏并无帮助. 瞬时性失败 (如网络错误) 则相反: 在尝试之间指数退避, 从 30s 起每次翻倍, 上限 5min, 记录为 Warn 级日志.
 
 ## 构建与测试

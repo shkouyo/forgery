@@ -83,12 +83,22 @@ type Client interface {
 // The concrete implementation is assembled by internal/app before any
 // goroutine starts; south and run use it to route every task to the Forgejo
 // instance that owns it.
+//
+// OnlyInstance lets the south proxy fall back to the sole configured
+// instance for task tokens that were never registered (tasks whose context
+// carries no token field), where routing cannot be ambiguous.
+//
+// Both methods are read-only and safe for concurrent use.
 type Resolver interface {
 	// Resolve returns the instance configuration and client registered
 	// under name. The second return value is false when no instance with
 	// that name exists (defensive path — config validation guarantees
 	// every TaskCtx.Instance matches a configured instance).
 	Resolve(name string) (config.Instance, Client, bool)
+	// OnlyInstance returns the name of the sole configured instance and
+	// true when exactly one instance is configured; false when zero or
+	// more than one instance are configured.
+	OnlyInstance() (string, bool)
 }
 
 // client is the northbound client that connects to a real Forgejo instance.

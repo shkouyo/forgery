@@ -92,6 +92,16 @@ func (r gcResolver) Resolve(name string) (config.Instance, north.Client, bool) {
 	return config.Instance{Name: name}, c, true
 }
 
+func (r gcResolver) OnlyInstance() (string, bool) {
+	if len(r) != 1 {
+		return "", false
+	}
+	for name := range r {
+		return name, true
+	}
+	return "", false
+}
+
 // newGCTask builds a TaskCtx in the given status with a controlled age.
 // RegTokenTTL defaults to 15 minutes (the config default) so Pending tasks
 // age out at the production boundary; tests that probe the TTL override it.

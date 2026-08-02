@@ -26,6 +26,13 @@
 // depends on the north.Resolver interface only to map the task's instance
 // name to its northbound client (UpdateTask/UpdateLog forwarding); it never
 // imports the concrete north client type nor internal/app.
+//
+// The south HTTP server also reverse-proxies the HTTP paths the internal
+// runner needs from the owning Forgejo instance — git smart/dumb HTTP for
+// actions/checkout, the /api/v1/repos/… default-branch query, and the
+// /api/actions_pipeline/… artifact endpoints. Requests are routed by the
+// task token carried in the Authorization header, which is recorded in a
+// per-task registry when the runner fetches the task (see proxy.go).
 package south
 
 import (
@@ -55,6 +62,7 @@ type Handler struct {
 	store    store.TaskStore
 	sessions *session.Manager
 	resolver north.Resolver // instance name → config + northbound client
+	registry *tokenRegistry // task token → owning instance (proxy routing)
 	log      *slog.Logger
 }
 
@@ -64,6 +72,7 @@ func NewHandler(s store.TaskStore, sm *session.Manager, resolver north.Resolver,
 		store:    s,
 		sessions: sm,
 		resolver: resolver,
+		registry: newTokenRegistry(sm),
 		log:      log,
 	}
 }
@@ -302,6 +311,11 @@ func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTa
 		"runner_name", sess.RunnerName,
 	)
 
+	// Register the task's runtime tokens so the runner's subsequent git,
+	// API, and artifact requests (Authorization header) can be proxied to
+	// the owning Forgejo instance (see proxy.go).
+	h.registry.putTaskTokens(sess.TaskCtx, sess.SessionToken, time.Now())
+
 	return connect.NewResponse(&v1.FetchTaskResponse{
 		Task: sess.TaskCtx.Task,
 	}), nil
@@ -416,5 +430,14 @@ func NewServer(handler *Handler, addr string) *http.Server {
 	// Register at both paths for compatibility with forgejo-runner
 	mux.Handle(path, h)
 	mux.Handle("/api/actions/", http.StripPrefix("/api/actions", h))
+	// Reverse-proxy git and Forgejo API paths to the owning instance. The
+	// two API prefixes get exact subtree patterns; git paths live on the /
+	// catch-all, where the handler matches them itself (matchGitPath) — the
+	// more specific Connect and /api/actions/ patterns above win for their
+	// own paths, so nothing existing is shadowed.
+	proxy := handler.newProxyHandler()
+	mux.Handle("/api/v1/repos/", proxy)
+	mux.Handle("/api/actions_pipeline/", proxy)
+	mux.Handle("/", proxy)
 	return &http.Server{Addr: addr, Handler: mux}
 }

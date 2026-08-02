@@ -98,6 +98,21 @@ func (r instanceResolver) Resolve(name string) (config.Instance, north.Client, b
 	return e.inst, e.client, true
 }
 
+// OnlyInstance returns the name of the sole configured instance, or false
+// when zero or multiple instances are configured. The south proxy uses it
+// to route task tokens that were never registered (tasks whose context
+// carries no token field) when the daemon serves exactly one Forgejo
+// instance.
+func (r instanceResolver) OnlyInstance() (string, bool) {
+	if len(r) != 1 {
+		return "", false
+	}
+	for name := range r {
+		return name, true
+	}
+	return "", false
+}
+
 // poller is the subset of the northbound client used to start polling. The
 // concrete type returned by north.New is unexported; app only needs this
 // structural interface.

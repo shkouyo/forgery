@@ -188,6 +188,16 @@ func (r *fakeResolver) Resolve(name string) (config.Instance, north.Client, bool
 	return e.inst, e.client, true
 }
 
+func (r *fakeResolver) OnlyInstance() (string, bool) {
+	if len(r.entries) != 1 {
+		return "", false
+	}
+	for name := range r.entries {
+		return name, true
+	}
+	return "", false
+}
+
 // instanceEntry is one resolver map value.
 type instanceEntry struct {
 	inst   config.Instance

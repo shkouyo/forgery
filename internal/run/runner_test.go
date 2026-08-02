@@ -160,6 +160,16 @@ func (r *mockResolver) Resolve(name string) (config.Instance, north.Client, bool
 	return e.inst, e.client, true
 }
 
+func (r *mockResolver) OnlyInstance() (string, bool) {
+	if len(r.entries) != 1 {
+		return "", false
+	}
+	for name := range r.entries {
+		return name, true
+	}
+	return "", false
+}
+
 // entry builds one resolver map value.
 func entry(name string, timeout time.Duration, client north.Client) instanceEntry {
 	return instanceEntry{
