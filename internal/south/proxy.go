@@ -114,13 +114,17 @@ func validRepoName(s string) bool {
 // Git clients (actions/checkout) authenticate with HTTP basic auth
 // ("Basic base64(x-access-token:<token>)"), while Forgejo API and artifact
 // requests use a bearer-style header ("Bearer <token>" or "token <token>").
-// Some git clients put the token in the username field ("<token>:" or
-// "<token>:x-oauth-basic"); the password, when present, takes precedence.
+// The scheme is matched case-insensitively — git and octokit emit lowercase
+// forms ("basic", "token") in the wild. Some git clients put the token in
+// the username field ("<token>:" or "<token>:x-oauth-basic"); the password,
+// when present, takes precedence.
 func proxyToken(auth string) (string, bool) {
 	auth = strings.TrimSpace(auth)
-	switch {
-	case strings.HasPrefix(auth, "Basic "):
-		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(auth[len("Basic "):]))
+	scheme, rest, _ := strings.Cut(auth, " ")
+	rest = strings.TrimSpace(rest)
+	switch strings.ToLower(scheme) {
+	case "basic":
+		raw, err := base64.StdEncoding.DecodeString(rest)
 		if err != nil {
 			return "", false
 		}
@@ -136,13 +140,13 @@ func proxyToken(auth string) (string, bool) {
 			return pass, true
 		}
 		return user, true
-	case strings.HasPrefix(auth, "Bearer "):
-		if tok := strings.TrimSpace(auth[len("Bearer "):]); tok != "" {
-			return tok, true
+	case "bearer":
+		if rest != "" {
+			return rest, true
 		}
-	case strings.HasPrefix(auth, "token "):
-		if tok := strings.TrimSpace(auth[len("token "):]); tok != "" {
-			return tok, true
+	case "token":
+		if rest != "" {
+			return rest, true
 		}
 	}
 	return "", false

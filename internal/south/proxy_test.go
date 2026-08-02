@@ -107,12 +107,18 @@ func TestProxyToken(t *testing.T) {
 		wantOK    bool
 	}{
 		{name: "checkout basic", auth: basic("x-access-token:task-tok-1"), wantToken: "task-tok-1", wantOK: true},
+		{name: "lowercase basic scheme", auth: "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:task-tok-1")), wantToken: "task-tok-1", wantOK: true},
+		{name: "mixed case basic scheme", auth: "bAsIc " + base64.StdEncoding.EncodeToString([]byte("x-access-token:task-tok-1")), wantToken: "task-tok-1", wantOK: true},
 		{name: "github style basic", auth: basic("task-tok-1:x-oauth-basic"), wantToken: "task-tok-1", wantOK: true},
 		{name: "bare user token", auth: basic("task-tok-1:"), wantToken: "task-tok-1", wantOK: true},
 		{name: "bearer", auth: "Bearer task-tok-1", wantToken: "task-tok-1", wantOK: true},
-		{name: "token scheme", auth: "token task-tok-1", wantToken: "task-tok-1", wantOK: true},
+		{name: "mixed case bearer scheme", auth: "BeArEr task-tok-1", wantToken: "task-tok-1", wantOK: true},
+		{name: "lowercase bearer scheme", auth: "bearer task-tok-1", wantToken: "task-tok-1", wantOK: true},
+		{name: "token scheme (octokit lowercase)", auth: "token task-tok-1", wantToken: "task-tok-1", wantOK: true},
+		{name: "mixed case token scheme", auth: "ToKeN task-tok-1", wantToken: "task-tok-1", wantOK: true},
 		{name: "empty header", auth: "", wantOK: false},
 		{name: "garbage scheme", auth: "Digest foo", wantOK: false},
+		{name: "lowercase garbage scheme", auth: "digest foo", wantOK: false},
 		{name: "malformed base64", auth: "Basic not-base64!!", wantOK: false},
 		{name: "empty password and user", auth: basic(":"), wantOK: false},
 		{name: "empty bearer", auth: "Bearer  ", wantOK: false},
@@ -358,6 +364,14 @@ func TestProxyGitAndAPIPassthrough(t *testing.T) {
 			path: "/someowner/somerepo/HEAD", auth: auth},
 		{name: "default branch query", method: http.MethodGet,
 			path: "/api/v1/repos/someowner/somerepo", query: "page=1", auth: "Bearer tok-a"},
+		{name: "default branch query lowercase bearer", method: http.MethodGet,
+			path: "/api/v1/repos/someowner/somerepo", query: "page=1", auth: "bearer tok-a"},
+		{name: "default branch query mixed case bearer", method: http.MethodGet,
+			path: "/api/v1/repos/someowner/somerepo", query: "page=1", auth: "BeArEr tok-a"},
+		{name: "default branch query token scheme", method: http.MethodGet,
+			path: "/api/v1/repos/someowner/somerepo", query: "page=1", auth: "token tok-a"},
+		{name: "git lowercase basic scheme", method: http.MethodGet,
+			path: "/someowner/somerepo.git/info/refs", query: "service=git-upload-pack", auth: "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:tok-a"))},
 		{name: "artifact upload", method: http.MethodPost,
 			path: "/api/actions_pipeline/upload", query: "run_id=9", body: "artifact-bytes", auth: "Bearer tok-a"},
 	}
@@ -450,7 +464,9 @@ func TestProxyUnauthorized(t *testing.T) {
 	}{
 		{name: "no authorization header", wantError: "missing task token"},
 		{name: "unrecognizable scheme", auth: "Digest abc", wantError: "missing task token"},
+		{name: "lowercase unrecognizable scheme", auth: "digest abc", wantError: "missing task token"},
 		{name: "unknown token", auth: basicAuth("not-a-task-token"), wantError: "unknown task token"},
+		{name: "unknown token lowercase basic", auth: "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:not-a-task-token")), wantError: "unknown task token"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -480,6 +496,7 @@ func TestProxySingleInstanceFallback(t *testing.T) {
 	// registry stays empty and every proxied request must fall back.
 	f := newProxyFixture(t, map[string]*fakeForgejo{"only-inst": forgejo}, "only-inst", "")
 
+	// Uppercase basic, the canonical checkout form.
 	resp := f.do(t, http.MethodGet, "/owner/repo/info/refs", "service=git-upload-pack", basicAuth("any-token"), "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body: %q)", resp.StatusCode, readBody(t, resp))
@@ -494,6 +511,36 @@ func TestProxySingleInstanceFallback(t *testing.T) {
 	// The Authorization header must pass through even on the fallback path.
 	if rec.auth != basicAuth("any-token") {
 		t.Fatalf("upstream Authorization = %q, want %q", rec.auth, basicAuth("any-token"))
+	}
+
+	// Lowercase schemes (git and octokit spellings) must fall back too.
+	lowerBasic := "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:any-token"))
+	resp = f.do(t, http.MethodGet, "/owner/repo/info/refs", "service=git-upload-pack", lowerBasic, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("lowercase basic: status = %d, want 200 (body: %q)", resp.StatusCode, readBody(t, resp))
+	}
+	if rec := forgejo.last(); rec.auth != lowerBasic {
+		t.Fatalf("lowercase basic: upstream Authorization = %q, want %q", rec.auth, lowerBasic)
+	}
+
+	resp = f.do(t, http.MethodGet, "/api/v1/repos/owner/repo", "page=1", "token any-token", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("lowercase token: status = %d, want 200 (body: %q)", resp.StatusCode, readBody(t, resp))
+	}
+	if rec := forgejo.last(); rec.auth != "token any-token" {
+		t.Fatalf("lowercase token: upstream Authorization = %q, want %q", rec.auth, "token any-token")
+	}
+
+	resp = f.do(t, http.MethodGet, "/api/v1/repos/owner/repo", "page=1", "BeArEr any-token", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mixed-case bearer: status = %d, want 200 (body: %q)", resp.StatusCode, readBody(t, resp))
+	}
+	if rec := forgejo.last(); rec.auth != "BeArEr any-token" {
+		t.Fatalf("mixed-case bearer: upstream Authorization = %q, want %q", rec.auth, "BeArEr any-token")
+	}
+
+	if forgejo.count() != 4 {
+		t.Fatalf("upstream saw %d requests, want 4", forgejo.count())
 	}
 }
 

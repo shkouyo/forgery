@@ -316,8 +316,19 @@ func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTa
 	// the owning Forgejo instance (see proxy.go).
 	h.registry.putTaskTokens(sess.TaskCtx, sess.SessionToken, time.Now())
 
+	// Resolve the owning instance and rewrite the checkout steps of the
+	// workflow payload so actions/checkout clones straight from that
+	// instance's Forgejo (with.github-server-url input) instead of through
+	// Forgery's proxy. The rewrite always starts from the stored payload and
+	// never mutates the store's task; when the instance is unknown or the
+	// rewrite fails, the stored task passes through unchanged.
+	task := sess.TaskCtx.Task
+	if inst, _, ok := h.resolveInstance(sess.TaskCtx); ok {
+		task = rewriteWorkflowPayload(task, inst.ForgejoURL)
+	}
+
 	return connect.NewResponse(&v1.FetchTaskResponse{
-		Task: sess.TaskCtx.Task,
+		Task: task,
 	}), nil
 }
 
