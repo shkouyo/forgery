@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-
+//
 // Copyright (C) 2026 ShinKouyo <i@0x0f.dev>
 //
 // This program is free software: you can redistribute it and/or modify
@@ -20,6 +20,7 @@ package south
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -27,6 +28,7 @@ import (
 
 	v1 "code.gitea.io/actions-proto-go/runner/v1"
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"git.0x0f.dev/forgery/internal/config"
 	"git.0x0f.dev/forgery/internal/session"
@@ -239,6 +241,261 @@ jobs:
 	})
 }
 
+// ── normalizeServerURLs ─────────────────────────────────────────────────────
+
+// serverURLPayload is a workflow payload exercising the server-URL expression
+// family: the github context (server_url / api_url / repository_url), the
+// env expressions (GITHUB_SERVER_URL / GITHUB_API_URL / FORGEJO_SERVER_URL),
+// a docker-registry login (the public_url leak this fix targets), and a
+// checkout step so injection and normalization can be tested together.
+const serverURLPayload = `name: push image
+"on": push
+jobs:
+    job9:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: docker/login-action@v3
+              with:
+                registry: ${{ github.server_url }}
+            - name: api
+              run: curl -sS ${{ github.api_url }}/repos/${{ github.repository_url }}
+            - name: envs
+              run: echo ${{ env.GITHUB_SERVER_URL }} ${{ env.GITHUB_API_URL }} ${{ env.FORGEJO_SERVER_URL }}
+`
+
+func TestNormalizeServerURLs(t *testing.T) {
+	const url = "https://forgejo.own.example.com"
+	const repo = "octocat/hello-world"
+
+	// The six keys act derives from --url, and the literal each becomes.
+	replacements := map[string]string{
+		"github.server_url":      url,
+		"github.api_url":         url + "/api/v1",
+		"github.repository_url":  url + "/" + repo,
+		"env.GITHUB_SERVER_URL":  url,
+		"env.GITHUB_API_URL":     url + "/api/v1",
+		"env.FORGEJO_SERVER_URL": url,
+	}
+
+	t.Run("expression table across whitespace variants", func(t *testing.T) {
+		variants := []struct {
+			name string
+			expr string
+		}{
+			{"no space", `${{%s}}`},
+			{"single space", `${{ %s }}`},
+			{"multi space", `${{  %s  }}`},
+		}
+		for key, want := range replacements {
+			for _, v := range variants {
+				name := strings.ReplaceAll(key, ".", "-") + " / " + v.name
+				t.Run(name, func(t *testing.T) {
+					expr := fmt.Sprintf(v.expr, key)
+					in := []byte("name: t\njobs:\n    j:\n        steps:\n            - run: echo " + expr + "\n")
+					out, err := normalizeServerURLs(in, url, repo)
+					if err != nil {
+						t.Fatalf("normalizeServerURLs: %v", err)
+					}
+					s := string(out)
+					if !strings.Contains(s, "echo "+want) {
+						t.Fatalf("want %q replaced by %q, got:\n%s", expr, want, s)
+					}
+					if strings.Contains(s, "${{") {
+						t.Fatalf("expression survived normalization:\n%s", s)
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("quoted scalars are rewritten in style", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        steps:
+            - run: "${{ github.server_url }}"
+            - run: '${{ github.server_url }}'
+`)
+		out, err := normalizeServerURLs(in, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		s := string(out)
+		if !strings.Contains(s, "\""+url+"\"") {
+			t.Fatalf("double-quoted scalar not rewritten:\n%s", s)
+		}
+		if !strings.Contains(s, "'"+url+"'") {
+			t.Fatalf("single-quoted scalar not rewritten:\n%s", s)
+		}
+	})
+
+	t.Run("docker login registry input is rewritten", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        steps:
+            - uses: docker/login-action@v3
+              with:
+                registry: ${{ github.server_url }}
+                username: ${{ github.actor }}
+`)
+		out, err := normalizeServerURLs(in, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		s := string(out)
+		if !strings.Contains(s, "registry: "+url) {
+			t.Fatalf("registry input not rewritten:\n%s", s)
+		}
+		if !strings.Contains(s, "username: ${{ github.actor }}") {
+			t.Fatalf("unrelated with input was touched:\n%s", s)
+		}
+	})
+
+	t.Run("run script interpolation keeps surrounding text", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        steps:
+            - run: docker push ${{ github.server_url }}/team/image:latest
+`)
+		out, err := normalizeServerURLs(in, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		s := string(out)
+		if !strings.Contains(s, "docker push "+url+"/team/image:latest") {
+			t.Fatalf("interpolated expression not rewritten in place:\n%s", s)
+		}
+	})
+
+	t.Run("unrelated expressions are left alone", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        steps:
+            - run: echo ${{ github.repository }} ${{ github.sha }} ${{ github.token }}
+            - run: echo ${{ secrets.BUILD_TOKEN }} ${{ needs.job1.outputs.output1 }}
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.ref }}
+`)
+		out, err := normalizeServerURLs(in, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		s := string(out)
+		for _, keep := range []string{
+			"${{ github.repository }}",
+			"${{ github.sha }}",
+			"${{ github.token }}",
+			"${{ secrets.BUILD_TOKEN }}",
+			"${{ needs.job1.outputs.output1 }}",
+			"ref: ${{ github.ref }}",
+		} {
+			if !strings.Contains(s, keep) {
+				t.Fatalf("unrelated expression %q was touched:\n%s", keep, s)
+			}
+		}
+	})
+
+	t.Run("comments containing the expression are untouched", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        # legacy: registry was ${{ github.server_url }}
+        steps:
+            - run: echo ${{ github.server_url }}
+`)
+		out, err := normalizeServerURLs(in, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		s := string(out)
+		if !strings.Contains(s, "# legacy: registry was ${{ github.server_url }}") {
+			t.Fatalf("comment was rewritten:\n%s", s)
+		}
+		if !strings.Contains(s, "echo "+url) {
+			t.Fatalf("scalar expression not rewritten:\n%s", s)
+		}
+	})
+
+	t.Run("repository_url with repository", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        steps:
+            - run: echo ${{ github.repository_url }}
+`)
+		out, err := normalizeServerURLs(in, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		if !bytes.Contains(out, []byte("echo "+url+"/"+repo)) {
+			t.Fatalf("repository_url not rewritten to url/repo:\n%s", out)
+		}
+	})
+
+	t.Run("repository_url skipped without repository", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        steps:
+            - run: echo ${{ github.repository_url }} ${{ github.server_url }}
+`)
+		out, err := normalizeServerURLs(in, url, "")
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		s := string(out)
+		if !strings.Contains(s, "echo ${{ github.repository_url }} "+url) {
+			t.Fatalf("repository_url must survive without a repository, got:\n%s", s)
+		}
+	})
+
+	t.Run("no expressions returns payload byte-identical", func(t *testing.T) {
+		in := []byte(`name: t
+jobs:
+    j:
+        steps:
+            - run: echo hi
+`)
+		out, err := normalizeServerURLs(in, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		if !bytes.Equal(out, in) {
+			t.Fatalf("payload without expressions must be returned unchanged:\n%s", out)
+		}
+	})
+
+	t.Run("invalid yaml fails and returns original", func(t *testing.T) {
+		in := []byte("jobs: [unclosed")
+		out, err := normalizeServerURLs(in, url, repo)
+		if err == nil {
+			t.Fatal("want error for invalid yaml")
+		}
+		if !bytes.Equal(out, in) {
+			t.Fatal("original payload must be returned on parse failure")
+		}
+	})
+
+	t.Run("idempotent across repeated normalizations", func(t *testing.T) {
+		first, err := normalizeServerURLs([]byte(serverURLPayload), url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		second, err := normalizeServerURLs(first, url, repo)
+		if err != nil {
+			t.Fatalf("normalizeServerURLs: %v", err)
+		}
+		if !bytes.Equal(first, second) {
+			t.Fatal("repeated normalization must produce identical bytes")
+		}
+	})
+}
+
 // ── rewriteWorkflowPayload ──────────────────────────────────────────────────
 
 func TestRewriteWorkflowPayload(t *testing.T) {
@@ -246,7 +503,7 @@ func TestRewriteWorkflowPayload(t *testing.T) {
 	original := []byte(samplePayload)
 	task := &v1.Task{Id: 1, WorkflowPayload: original}
 
-	rewritten := rewriteWorkflowPayload(task, url)
+	rewritten := rewriteWorkflowPayload(task, url, "")
 	if rewritten == task {
 		t.Fatal("rewrite must return a copy, not the store task")
 	}
@@ -259,35 +516,66 @@ func TestRewriteWorkflowPayload(t *testing.T) {
 	}
 
 	t.Run("idempotent across repeated rewrites", func(t *testing.T) {
-		first := rewriteWorkflowPayload(task, url).WorkflowPayload
-		second := rewriteWorkflowPayload(task, url).WorkflowPayload
+		first := rewriteWorkflowPayload(task, url, "").WorkflowPayload
+		second := rewriteWorkflowPayload(task, url, "").WorkflowPayload
 		if !bytes.Equal(first, second) {
 			t.Fatal("repeated rewrites must produce identical bytes")
 		}
 	})
 
+	t.Run("normalizes expressions alongside checkout injection", func(t *testing.T) {
+		orig := []byte(serverURLPayload)
+		got := rewriteWorkflowPayload(&v1.Task{Id: 2, WorkflowPayload: orig}, url, "octocat/hello-world")
+		if got.WorkflowPayload == nil {
+			t.Fatal("rewrite returned nil payload")
+		}
+		s := string(got.WorkflowPayload)
+		for _, want := range []string{
+			"github-server-url: " + url,
+			"registry: " + url,
+			"curl -sS " + url + "/api/v1/repos/" + url + "/octocat/hello-world",
+			"echo " + url + " " + url + "/api/v1 " + url,
+		} {
+			if !strings.Contains(s, want) {
+				t.Fatalf("rewritten payload lacks %q:\n%s", want, s)
+			}
+		}
+		if strings.Contains(s, "${{") {
+			t.Fatalf("server-URL expressions survived rewrite:\n%s", s)
+		}
+		// The store task is untouched.
+		if !bytes.Equal(orig, []byte(serverURLPayload)) {
+			t.Fatal("store task payload was mutated")
+		}
+		// Rewriting the already-rewritten payload changes nothing.
+		again := rewriteWorkflowPayload(&v1.Task{Id: 2, WorkflowPayload: got.WorkflowPayload}, url, "octocat/hello-world")
+		if !bytes.Equal(again.WorkflowPayload, got.WorkflowPayload) {
+			t.Fatal("rewriting an already-rewritten payload must be a no-op")
+		}
+	})
+
 	t.Run("passes through when nothing matches", func(t *testing.T) {
-		plain := &v1.Task{Id: 2, WorkflowPayload: []byte("name: t\njobs:\n  j:\n    steps:\n      - uses: actions/setup-node@v4\n")}
-		if got := rewriteWorkflowPayload(plain, url); got != plain {
+		plain := &v1.Task{Id: 3, WorkflowPayload: []byte("name: t\njobs:\n  j:\n    steps:\n      - uses: actions/setup-node@v4\n")}
+		if got := rewriteWorkflowPayload(plain, url, ""); got != plain {
 			t.Fatal("no-match rewrite must return the original task")
 		}
 	})
 
 	t.Run("passes through on empty payload or url", func(t *testing.T) {
-		if got := rewriteWorkflowPayload(&v1.Task{Id: 3}, url); got.WorkflowPayload != nil {
+		if got := rewriteWorkflowPayload(&v1.Task{Id: 4}, url, ""); got.WorkflowPayload != nil {
 			t.Fatal("nil payload must pass through")
 		}
-		if got := rewriteWorkflowPayload(&v1.Task{Id: 4, WorkflowPayload: original}, ""); !bytes.Equal(got.WorkflowPayload, original) {
+		if got := rewriteWorkflowPayload(&v1.Task{Id: 5, WorkflowPayload: original}, "", ""); !bytes.Equal(got.WorkflowPayload, original) {
 			t.Fatal("empty url must pass through")
 		}
-		if got := rewriteWorkflowPayload(nil, url); got != nil {
+		if got := rewriteWorkflowPayload(nil, url, ""); got != nil {
 			t.Fatal("nil task must pass through")
 		}
 	})
 
 	t.Run("passes through on parse failure", func(t *testing.T) {
-		broken := &v1.Task{Id: 5, WorkflowPayload: []byte("jobs: [unclosed")}
-		if got := rewriteWorkflowPayload(broken, url); got != broken {
+		broken := &v1.Task{Id: 6, WorkflowPayload: []byte("jobs: [unclosed")}
+		if got := rewriteWorkflowPayload(broken, url, ""); got != broken {
 			t.Fatal("unparseable payload must pass through unchanged")
 		}
 	})
@@ -297,8 +585,9 @@ func TestRewriteWorkflowPayload(t *testing.T) {
 
 // TestFetchTaskRewritesCheckoutPayload wires a full handler: a store task
 // with a real workflow payload owned by an instance with a ForgejoURL, and
-// asserts FetchTask returns the rewritten payload while the store's task
-// stays byte-identical, and that a second FetchTask is byte-identical too.
+// asserts FetchTask returns the rewritten payload (checkout input injected,
+// server-URL expressions normalized) while the store's task stays
+// byte-identical, and that a second FetchTask is byte-identical too.
 func TestFetchTaskRewritesCheckoutPayload(t *testing.T) {
 	ms := newMockStore()
 	sm := session.NewManager()
@@ -311,9 +600,15 @@ func TestFetchTaskRewritesCheckoutPayload(t *testing.T) {
 	h := NewHandler(ms, sm, resolver, slog.New(slog.DiscardHandler))
 
 	taskCtx := &store.TaskCtx{
-		ID:          99,
-		Instance:    "inst-a",
-		Task:        &v1.Task{Id: 99, WorkflowPayload: []byte(samplePayload)},
+		ID:       99,
+		Instance: "inst-a",
+		Task: &v1.Task{
+			Id:              99,
+			WorkflowPayload: []byte(serverURLPayload),
+			Context: &structpb.Struct{Fields: map[string]*structpb.Value{
+				"repository": structpb.NewStringValue("octocat/hello-world"),
+			}},
+		},
 		RegToken:    "reg-payload",
 		RegTokenTTL: 15 * time.Minute,
 		CreatedAt:   time.Now(),
@@ -333,10 +628,21 @@ func TestFetchTaskRewritesCheckoutPayload(t *testing.T) {
 	}
 
 	first := fetch(t)
-	if !bytes.Contains(first.WorkflowPayload, []byte("github-server-url: https://forgejo.a.example.com")) {
-		t.Fatalf("fetched payload lacks the injected input:\n%s", first.WorkflowPayload)
+	s := string(first.WorkflowPayload)
+	for _, want := range []string{
+		"github-server-url: https://forgejo.a.example.com",
+		"registry: https://forgejo.a.example.com",
+		"curl -sS https://forgejo.a.example.com/api/v1/repos/https://forgejo.a.example.com/octocat/hello-world",
+		"echo https://forgejo.a.example.com https://forgejo.a.example.com/api/v1 https://forgejo.a.example.com",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("fetched payload lacks %q:\n%s", want, s)
+		}
 	}
-	if !bytes.Equal(taskCtx.Task.WorkflowPayload, []byte(samplePayload)) {
+	if strings.Contains(s, "${{") {
+		t.Fatalf("server-URL expressions survived FetchTask:\n%s", s)
+	}
+	if !bytes.Equal(taskCtx.Task.WorkflowPayload, []byte(serverURLPayload)) {
 		t.Fatal("store task payload was mutated by FetchTask")
 	}
 
@@ -344,8 +650,48 @@ func TestFetchTaskRewritesCheckoutPayload(t *testing.T) {
 	if !bytes.Equal(first.WorkflowPayload, second.WorkflowPayload) {
 		t.Fatal("repeated FetchTask must return byte-identical payloads")
 	}
-	if !bytes.Equal(taskCtx.Task.WorkflowPayload, []byte(samplePayload)) {
+	if !bytes.Equal(taskCtx.Task.WorkflowPayload, []byte(serverURLPayload)) {
 		t.Fatal("store task payload was mutated by a second FetchTask")
+	}
+}
+
+// TestFetchTaskSkipsRepositoryURLWithoutContext pins the repository_url
+// fallback: a task whose context carries no "repository" field keeps the
+// expression while every other server-URL expression is still normalized.
+func TestFetchTaskSkipsRepositoryURLWithoutContext(t *testing.T) {
+	ms := newMockStore()
+	sm := session.NewManager()
+	resolver := newFakeResolver(map[string]instanceEntry{
+		"inst-b": {
+			inst:   config.Instance{Name: "inst-b", ForgejoURL: "https://forgejo.b.example.com"},
+			client: newMockClient(),
+		},
+	})
+	h := NewHandler(ms, sm, resolver, slog.New(slog.DiscardHandler))
+
+	taskCtx := &store.TaskCtx{
+		ID:          101,
+		Instance:    "inst-b",
+		Task:        &v1.Task{Id: 101, WorkflowPayload: []byte("name: t\njobs:\n    j:\n        steps:\n            - run: echo ${{ github.repository_url }} ${{ github.server_url }}\n")},
+		RegToken:    "reg-norepo",
+		RegTokenTTL: 15 * time.Minute,
+		CreatedAt:   time.Now(),
+	}
+	ms.PutPending(taskCtx)
+	sm.CreateWithToken(taskCtx, "sess-norepo", "", nil)
+
+	req := connect.NewRequest(&v1.FetchTaskRequest{})
+	setBearer(req, "sess-norepo")
+	resp, err := h.FetchTask(context.Background(), req)
+	if err != nil {
+		t.Fatalf("FetchTask failed: %v", err)
+	}
+	s := string(resp.Msg.GetTask().GetWorkflowPayload())
+	if !strings.Contains(s, "echo ${{ github.repository_url }} https://forgejo.b.example.com") {
+		t.Fatalf("repository_url must survive without a repository context:\n%s", s)
+	}
+	if !bytes.Equal(taskCtx.Task.WorkflowPayload, []byte("name: t\njobs:\n    j:\n        steps:\n            - run: echo ${{ github.repository_url }} ${{ github.server_url }}\n")) {
+		t.Fatal("store task payload was mutated by FetchTask")
 	}
 }
 

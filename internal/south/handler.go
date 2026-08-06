@@ -316,20 +316,35 @@ func (h *Handler) FetchTask(ctx context.Context, req *connect.Request[v1.FetchTa
 	// the owning Forgejo instance (see proxy.go).
 	h.registry.putTaskTokens(sess.TaskCtx, sess.SessionToken, time.Now())
 
-	// Resolve the owning instance and rewrite the checkout steps of the
-	// workflow payload so actions/checkout clones straight from that
-	// instance's Forgejo (with.github-server-url input) instead of through
-	// Forgery's proxy. The rewrite always starts from the stored payload and
-	// never mutates the store's task; when the instance is unknown or the
-	// rewrite fails, the stored task passes through unchanged.
+	// Resolve the owning instance and adapt the workflow payload to it:
+	// checkout steps get with.github-server-url (clones go straight to that
+	// instance's Forgejo) and every server-URL derived ${{ }} expression is
+	// normalized to its forgejo_url literal (docker registry pushes, API
+	// calls, clone URLs — see payload.go). The owner/repo for the
+	// repository_url replacement comes from the task context. The rewrite
+	// always starts from the stored payload and never mutates the store's
+	// task; when the instance is unknown or the rewrite fails, the stored
+	// task passes through unchanged.
 	task := sess.TaskCtx.Task
 	if inst, _, ok := h.resolveInstance(sess.TaskCtx); ok {
-		task = rewriteWorkflowPayload(task, inst.ForgejoURL)
+		task = rewriteWorkflowPayload(task, inst.ForgejoURL, repositoryFromContext(task))
 	}
 
 	return connect.NewResponse(&v1.FetchTaskResponse{
 		Task: task,
 	}), nil
+}
+
+// repositoryFromContext reads the "repository" field (owner/repo) of the
+// task context — the same key forgejo-runner's preset github context consumes
+// (vendored act, internal/app/run/runner.go: preset.Repository =
+// taskContext["repository"]). An absent or non-string field yields "", in
+// which case the repository_url expression replacement is skipped.
+func repositoryFromContext(task *v1.Task) string {
+	if task == nil || task.Context == nil {
+		return ""
+	}
+	return task.Context.Fields["repository"].GetStringValue()
 }
 
 // UpdateTask handles the UpdateTask RPC. The internal runner reports task
