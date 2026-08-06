@@ -139,19 +139,19 @@ func injectCheckoutServerURL(payload []byte, forgejoURL string) ([]byte, error) 
 // (server_url / api_url; repository_url is not a field of the vendored act's
 // GithubContext, so it evaluates to empty and rewriting to a literal is even
 // more correct) and the env keys withGithubEnv writes (GITHUB_SERVER_URL /
-// GITHUB_API_URL / FORGEJO_SERVER_URL — FORGEJO_* is set alongside every
+// GITHUB_API_URL / FORGEJO_SERVER_URL / FORGEJO_API_URL — FORGEJO_* is set alongside every
 // GITHUB_* by withGithubEnv's prefix loop). Whitespace inside the braces is
 // ignored: ${{github.server_url}}, ${{ github.server_url }} and
 // ${{  github.server_url  }} all match. Anything else — ${{ github.repository
 // }}, ${{ secrets.X }}, larger format() expressions — is left alone.
 var serverURLExprRe = regexp.MustCompile(
-	`\$\{\{\s*(github\.server_url|github\.api_url|github\.repository_url|env\.GITHUB_SERVER_URL|env\.GITHUB_API_URL|env\.FORGEJO_SERVER_URL)\s*\}\}`)
+	`\$\{\{\s*(github\.server_url|github\.api_url|github\.repository_url|env\.GITHUB_SERVER_URL|env\.GITHUB_API_URL|env\.FORGEJO_API_URL|env\.FORGEJO_SERVER_URL)\s*\}\}`)
 
 // normalizeServerURLs replaces every server-URL derived ${{ }} expression in
 // the workflow payload with the forgejoURL literal, so the job behaves as if
 // it were natively connected to the owning instance: github.server_url and
 // env.GITHUB_SERVER_URL / env.FORGEJO_SERVER_URL become forgejoURL,
-// github.api_url and env.GITHUB_API_URL become forgejoURL + "/api/v1", and
+// github.api_url and env.GITHUB_API_URL / env.FORGEJO_API_URL become forgejoURL + "/api/v1", and
 // github.repository_url becomes forgejoURL + "/" + repository (repository is
 // the task context's "owner/repo" — when it is empty the repository_url
 // expression is left untouched). Only scalar value nodes are rewritten —
@@ -177,7 +177,7 @@ func normalizeServerURLs(payload []byte, forgejoURL, repository string) ([]byte,
 		switch key {
 		case "github.server_url", "env.GITHUB_SERVER_URL", "env.FORGEJO_SERVER_URL":
 			return forgejoURL
-		case "github.api_url", "env.GITHUB_API_URL":
+		case "github.api_url", "env.GITHUB_API_URL", "env.FORGEJO_API_URL":
 			return forgejoURL + "/api/v1"
 		case "github.repository_url":
 			if repository == "" {

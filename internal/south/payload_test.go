@@ -245,7 +245,7 @@ jobs:
 
 // serverURLPayload is a workflow payload exercising the server-URL expression
 // family: the github context (server_url / api_url / repository_url), the
-// env expressions (GITHUB_SERVER_URL / GITHUB_API_URL / FORGEJO_SERVER_URL),
+// env expressions (GITHUB_SERVER_URL / GITHUB_API_URL / FORGEJO_SERVER_URL / FORGEJO_API_URL),
 // a docker-registry login (the public_url leak this fix targets), and a
 // checkout step so injection and normalization can be tested together.
 const serverURLPayload = `name: push image
@@ -261,20 +261,21 @@ jobs:
             - name: api
               run: curl -sS ${{ github.api_url }}/repos/${{ github.repository_url }}
             - name: envs
-              run: echo ${{ env.GITHUB_SERVER_URL }} ${{ env.GITHUB_API_URL }} ${{ env.FORGEJO_SERVER_URL }}
+              run: echo ${{ env.GITHUB_SERVER_URL }} ${{ env.GITHUB_API_URL }} ${{ env.FORGEJO_SERVER_URL }} ${{ env.FORGEJO_API_URL }}
 `
 
 func TestNormalizeServerURLs(t *testing.T) {
 	const url = "https://forgejo.own.example.com"
 	const repo = "octocat/hello-world"
 
-	// The six keys act derives from --url, and the literal each becomes.
+	// The seven keys act derives from --url, and the literal each becomes.
 	replacements := map[string]string{
 		"github.server_url":      url,
 		"github.api_url":         url + "/api/v1",
 		"github.repository_url":  url + "/" + repo,
 		"env.GITHUB_SERVER_URL":  url,
 		"env.GITHUB_API_URL":     url + "/api/v1",
+		"env.FORGEJO_API_URL":    url + "/api/v1",
 		"env.FORGEJO_SERVER_URL": url,
 	}
 
@@ -534,7 +535,7 @@ func TestRewriteWorkflowPayload(t *testing.T) {
 			"github-server-url: " + url,
 			"registry: " + url,
 			"curl -sS " + url + "/api/v1/repos/" + url + "/octocat/hello-world",
-			"echo " + url + " " + url + "/api/v1 " + url,
+			"echo " + url + " " + url + "/api/v1 " + url + " " + url + "/api/v1",
 		} {
 			if !strings.Contains(s, want) {
 				t.Fatalf("rewritten payload lacks %q:\n%s", want, s)
@@ -633,7 +634,7 @@ func TestFetchTaskRewritesCheckoutPayload(t *testing.T) {
 		"github-server-url: https://forgejo.a.example.com",
 		"registry: https://forgejo.a.example.com",
 		"curl -sS https://forgejo.a.example.com/api/v1/repos/https://forgejo.a.example.com/octocat/hello-world",
-		"echo https://forgejo.a.example.com https://forgejo.a.example.com/api/v1 https://forgejo.a.example.com",
+		"echo https://forgejo.a.example.com https://forgejo.a.example.com/api/v1 https://forgejo.a.example.com https://forgejo.a.example.com/api/v1",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("fetched payload lacks %q:\n%s", want, s)
